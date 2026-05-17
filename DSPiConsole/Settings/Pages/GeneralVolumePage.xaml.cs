@@ -1,18 +1,18 @@
-﻿using DSPiConsole.Models;
-using DSPiConsole.ViewModels;
+﻿using DSPiConsole.ViewModels;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 
 namespace DSPiConsole.Settings.Pages;
 
 /// <summary>
-/// General › Volume — two settings that govern how volume is stored
-/// and which slider the main window's sidebar drives.
+/// General › Volume — master-volume persistence mode. The sidebar slider's
+/// master-vs-user mode lives on the sidebar dropdown itself (next to the
+/// slider), so there's no separate settings card for it here.
 ///
 /// <para>
 /// Master Volume Mode is flash-persistent on the device (Phase 1 still
-/// writes on each change). Sidebar Volume Mode is AppSettings JSON and
-/// is live-applied.
+/// writes on each change; Phase 2 will route through the pending-change
+/// tracker).
 /// </para>
 /// </summary>
 public sealed partial class GeneralVolumePage : SettingsModule, ISettingsPage
@@ -28,11 +28,6 @@ public sealed partial class GeneralVolumePage : SettingsModule, ISettingsPage
         try
         {
             MasterVolumeModeCombo.SelectedIndex = Vm.MasterVolumeMode == 1 ? 1 : 0;
-
-            // Sidebar mode is "master" or "user" string in AppSettings. Map
-            // the Tag back to the index. Default to Master if anything's odd.
-            var mode = AppSettings.Instance.SidebarVolumeMode;
-            SidebarVolumeModeCombo.SelectedIndex = mode == "user" ? 1 : 0;
         }
         finally { _suppress = false; }
     }
@@ -43,8 +38,7 @@ public sealed partial class GeneralVolumePage : SettingsModule, ISettingsPage
         if (MasterVolumeModeCombo.SelectedItem is not ComboBoxItem item) return;
         if (!byte.TryParse(item.Tag?.ToString() ?? "0", out var newMode)) return;
 
-        // Flash-persistent — stage rather than commit. Sidebar Volume
-        // Mode below stays live (AppSettings JSON, not flash).
+        // Flash-persistent — stage rather than commit.
         var oldMode = Vm.MasterVolumeMode;
         var vm = Vm;
         static string Label(byte m) => m == 1 ? "Per preset" : "Global";
@@ -55,18 +49,6 @@ public sealed partial class GeneralVolumePage : SettingsModule, ISettingsPage
             OldDisplay: Label(oldMode),
             NewDisplay: Label(newMode),
             Apply: async () => await vm.SetMasterVolumeMode(newMode) ? (byte)0 : (byte)0xFF));
-    }
-
-    private void OnSidebarVolumeModeChanged(object sender, SelectionChangedEventArgs e)
-    {
-        if (_suppress) return;
-        if (SidebarVolumeModeCombo.SelectedItem is not ComboBoxItem item) return;
-        var mode = (item.Tag as string) ?? "master";
-        var s = AppSettings.Instance;
-        if (s.SidebarVolumeMode == mode) return;
-        s.SidebarVolumeMode = mode;
-        s.Save();
-        s.NotifyChanged();
     }
 
     // ── ISettingsPage ──────────────────────────────────────────────────

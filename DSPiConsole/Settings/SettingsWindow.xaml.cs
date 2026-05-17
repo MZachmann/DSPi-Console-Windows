@@ -173,13 +173,21 @@ public sealed partial class SettingsWindow : Window
 
     private async Task ConfirmCloseAsync()
     {
+        // Same flash/global clarifier as the InfoBar in SettingsShell.xaml.
+        // Settings tracked here are all device-flash writes (master volume
+        // mode, DAC mute config, output assignments, startup preset, …),
+        // distinct from per-preset DSP state — spell that out so the user
+        // knows what "Save to flash" actually does at close time.
+        var countLine = Tracker.Count == 1
+            ? "You have 1 unsaved device setting."
+            : $"You have {Tracker.Count} unsaved device settings.";
         var dialog = new ContentDialog
         {
             Title = "Pending device changes",
-            Content = Tracker.Count == 1
-                ? "You have 1 unapplied device change. Apply it before closing?"
-                : $"You have {Tracker.Count} unapplied device changes. Apply them before closing?",
-            PrimaryButtonText = "Apply",
+            Content = countLine
+                + " Saving writes them directly to device flash and applies them globally — they are independent of the currently loaded preset."
+                + "\n\nSave to flash before closing?",
+            PrimaryButtonText = "Save to flash",
             SecondaryButtonText = "Discard",
             CloseButtonText = "Cancel",
             DefaultButton = ContentDialogButton.Primary,

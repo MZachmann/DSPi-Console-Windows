@@ -353,19 +353,10 @@ public partial class DspDevice : ObservableObject, IDisposable
     private SystemStatus? _currentStatus;
 
     /// <summary>All currently connected DSPi devices.</summary>
-    public IReadOnlyList<DSPiDeviceInfo> AvailableDevicesList => _availableDevices;
+    public IReadOnlyList<DSPiDeviceInfo> AvailableDevicesList => _usb.AvailableDevices;
 
     /// <summary>The currently selected/active device.</summary>
-    public DSPiDeviceInfo? SelectedDeviceInfo
-    {
-        get => _selectedDeviceInfo;
-        private set
-        {
-            if (_selectedDeviceInfo == value) return;
-            _selectedDeviceInfo = value;
-            OnPropertyChanged(nameof(SelectedDeviceInfo));
-        }
-    }
+    public DSPiDeviceInfo? SelectedDeviceInfo => _usb.SelectedDeviceInfo;
 
     public event EventHandler? DeviceConnected;
     public event EventHandler? DeviceDisconnected;
@@ -416,117 +407,13 @@ public partial class DspDevice : ObservableObject, IDisposable
     // V7 input config block sits at offsetof(WireBulkParams, input_config) = 2896.
     // input_source occupies the first byte of the 16-byte WireInputConfig struct.
     private const int InputSourceWireOffset = 2896;
-
+    
     // V9+ user volume block sits at offsetof(WireBulkParams, user_volume) = 2928
     // (after input_config @ 2896 and lg_sound_sync @ 2912). user_volume_db
     // occupies the first 4 bytes (float dB) of the 16-byte WireUserVolume
     // struct; user_mute lives at +4.
     private const int UserVolumeWireOffset = 2928;
-
-    public DspDevice()
-    {
-        // Poll for devices every 500ms
-        _pollTimer = new System.Timers.Timer(500);
-        _pollTimer.Elapsed += (_, _) => ScanDevices();
-        _pollTimer.AutoReset = true;
-
-        // Poll for status every 100ms when connected
-        _statusPollTimer = new System.Timers.Timer(100);
-        _statusPollTimer.Elapsed += (_, _) => PollStatus();
-        _statusPollTimer.AutoReset = true;
-    }
-
-    public void StartMonitoring()
-    {
-        _pollTimer.Start();
-        ScanDevices();
-    }
-
-    public void StopMonitoring()
-    {
-        _pollTimer.Stop();
-    }
-
-    /// <summary>
-    /// Read the serial number from a temporarily opened USB device using the
-    /// vendor GET_SERIAL control request. The device must already be open and
-    /// have its interface claimed.
-    /// </summary>
-    private static string? ReadSerialFromDevice(IUsbDevice tempDevice)
-    {
-        var setupPacket = new UsbSetupPacket(RequestTypeIn, VendorCommands.GetSerial, 0, VendorInterfaceNumber, 16);
-        var buffer = new byte[16];
-        int transferred = tempDevice.ControlTransfer(setupPacket, buffer, 0, buffer.Length);
-        if (transferred > 0)
-            return System.Text.Encoding.ASCII.GetString(buffer, 0, transferred).TrimEnd('\0');
-        return null;
-    }
-
-    /// <summary>
-    /// Configure (idempotent on Windows/WinUSB) and claim the vendor interface
-    /// on a freshly opened device. Returns true on success.
-    /// </summary>
-    private static bool ConfigureAndClaim(IUsbDevice dev)
-    {
-        try { dev.SetConfiguration(1); }
-        catch { /* already configured by Windows; libusb winusb backend tolerates this */ }
-        return dev.ClaimInterface(VendorInterfaceNumber);
-    }
-
-    /// <summary>
-    /// Cached serials keyed by (bus, address). Avoids opening matching devices
-    /// repeatedly on every scan tick — a duplicate open of the currently-active
-    /// device disturbs the in-flight control transfer queue on the original
-    /// handle (WinUSB lets the second open through, then SetConfiguration /
-    /// ClaimInterface on the duplicate handle stomps the original's state and
-    /// every subsequent control GET silently returns 0 bytes).
-    /// </summary>
-    private readonly Dictionary<(byte bus, byte addr), string> _serialCache = new();
-
-    private static (byte bus, byte addr) GetBusAddr(IUsbDevice dev)
-    {
-        // BusNumber/Address live on the concrete UsbDevice — IUsbDevice doesn't
-        // expose them. Fall back to (0,0) if the cast fails (won't happen with
-        // the libusb-1.0 backend, which always returns UsbDevice instances).
-        if (dev is UsbDevice ud) return (ud.BusNumber, ud.Address);
-        return (0, 0);
-    }
-
-    /// <summary>
-    /// Scan for all connected DSPi devices, update the available list,
-    /// and auto-select/reconnect as needed.
-    /// </summary>
-    private void ScanDevices()
-    {
-        if (_disposed) return;
-
-        try
-        {
-            using var allDevicesList = _context.List();
-            var matching = allDevicesList
-                .Where(d => d.VendorId == VendorId && d.ProductId == ProductId)
-                .ToList();
-
-            // Drop cache entries for devices that have unplugged.
-            var liveKeys = matching.Select(GetBusAddr).ToHashSet();
-            foreach (var stale in _serialCache.Keys.Where(k => !liveKeys.Contains(k)).ToList())
-                _serialCache.Remove(stale);
-
-            // Build the current device list. For the device we already have open,
-            // skip the open/claim/read cycle entirely — we know its serial.
-            var currentDevices = new List<DSPiDeviceInfo>();
-            (byte bus, byte addr) openKey = (_openBusNumber, _openAddress);
-            bool weHaveOpen = _device != null && IsConnected && _selectedDeviceInfo != null;
-
-            foreach (var dev in matching)
-            {
-                var key = GetBusAddr(dev);
-
-                if (weHaveOpen && key.bus == openKey.bus && key.addr == openKey.addr)
-                {
-                    currentDevices.Add(_selectedDeviceInfo!);
-                    continue;
-                }
+    
     public DspDevice() : this(CreateDefaultTransfer()) { }
 
     private static IDspiTransfer CreateDefaultTransfer()

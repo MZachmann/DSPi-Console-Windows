@@ -21,19 +21,5 @@
                 <ComboBoxItem Content="Per preset" Tag="1"/>
             </ComboBox>
         </controls:SettingsCard>
-
-        <!--
-            Sidebar volume control mode — AppSettings only (JSON file).
-            Live-applied: the change takes effect on the next NotifyChanged.
-        -->
-        <controls:SettingsCard Header="Sidebar volume slider"
-                                Description="Choose which volume the main-window slider drives. User volume mirrors the Windows audio host; Master volume drives the firmware's hardware attenuator.">
-                        <ComboBox x:Name="SidebarVolumeModeCombo"
-                      MinWidth="160"
-                      SelectionChanged="OnSidebarVolumeModeChanged">
-                <ComboBoxItem Content="Master volume" Tag="master"/>
-                <ComboBoxItem Content="User volume"   Tag="user"/>
-            </ComboBox>
-        </controls:SettingsCard>
     </StackPanel>
 </settings:SettingsModule>

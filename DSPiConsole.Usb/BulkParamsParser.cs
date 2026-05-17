@@ -80,19 +80,42 @@ public class BulkParams
     public byte InputSource;        // 0 = USB, 1 = S/PDIF
     public byte SpdifRxPin;          // GPIO pin (informational; not applied via bulk SET)
     public bool HasInputConfig;
+
+    // LG Sound Sync (offset 2912, 16 bytes) — V8+, present when packet >= 2928.
+    // Only the user-writable `enabled` flag is captured; the runtime
+    // observation fields (present, volume, muted) are diagnostic-only and
+    // not part of preset state.
+    public bool LgSoundSyncEnabled;
+    public bool HasLgSoundSync;
+
+    // User volume / vendor mute (offset 2928, 16 bytes) — V9+, present
+    // when packet >= 2944. UserVolumeDb mirrors the UAC1 host slider's
+    // dB value; UserMute is the standalone vendor mute (independent of
+    // UAC1 mute state — see Documentation/current_architecture.md).
+    public float UserVolumeDb;
+    public bool UserMute;
+    public bool HasUserVolume;
+
+    // External DAC hardware mute (offset 2944, 16 bytes) — V10+, present
+    // when packet >= 2960. Decoded via DacHwMuteConfig.TryParse so the
+    // wire layout lives in one place.
+    public DacHwMuteConfig? DacHwMute;
+    public bool HasDacHwMute;
 }
 
 /// <summary>
 /// Parses the bulk parameter packet from firmware. V2 is 2832 bytes; V3+ grows
 /// with trailing optional sections (I2S, leveller, per-channel preamp, master
-/// volume, input source). V7 is 2912 bytes. Accept any version &gt;= V2 so newer
-/// firmwares aren't rejected, and key feature presence off the actual transfer
-/// length so older firmware still works.
+/// volume, input source, LG Sound Sync, user volume / mute, DAC hardware
+/// mute). V10 is 2960 bytes. Accept any version &gt;= V2 so newer firmwares
+/// aren't rejected, and key feature presence off the actual transfer length
+/// so older firmware still works.
 /// </summary>
 public static class BulkParamsParser
 {
-    public const int PacketSize = 2832;        // V2 minimum payload
-    public const int PacketSizeV7 = 2912;      // V7 full payload (2896 + WireInputConfig)
+    public const int PacketSize = 2832;         // V2 minimum payload
+    public const int PacketSizeV7 = 2912;       // V7 payload (V2 + I2S + leveller + preamp + master + input)
+    public const int PacketSizeV10 = 2960;      // V10 payload (V7 + LG + user vol + DAC HW mute)
     public const byte MinFormatVersion = 2;
 
     // Section offsets
@@ -260,6 +283,40 @@ public static class BulkParamsParser
             p.HasInputConfig = true;
             p.InputSource = buffer[OffsetInputCfg + 0];
             p.SpdifRxPin = buffer[OffsetInputCfg + 1];
+        }
+
+        // ── LG Sound Sync (16 bytes, V8+) ──
+        // WireLgSoundSync: enabled(1), present(1), volume(1), muted(1),
+        // reserved[12]. Only `enabled` is preset state; runtime fields
+        // (present, volume, muted) are diagnostic and not captured here.
+        const int OffsetLgSoundSync = 2912;
+        if (p.FormatVersion >= 8 && buffer.Length >= OffsetLgSoundSync + 16)
+        {
+            p.HasLgSoundSync = true;
+            p.LgSoundSyncEnabled = buffer[OffsetLgSoundSync + 0] != 0;
+        }
+
+        // ── User volume / vendor mute (16 bytes, V9+) ──
+        // WireUserVolume: user_volume_db(float, 4), user_mute(1), reserved[11]
+        const int OffsetUserVolume = 2928;
+        if (p.FormatVersion >= 9 && buffer.Length >= OffsetUserVolume + 16)
+        {
+            p.HasUserVolume = true;
+            p.UserVolumeDb = BitConverter.ToSingle(buffer, OffsetUserVolume + 0);
+            p.UserMute = buffer[OffsetUserVolume + 4] != 0;
+        }
+
+        // ── External DAC hardware mute (16 bytes, V10+) ──
+        // WireDacHwMute: enabled(1), active_low(1), pin(1), reserved0(1),
+        // hold_ms(uint16 LE), release_ms(uint16 LE), reserved[8]. Decoded
+        // via DacHwMuteConfig.TryParse so the wire layout (LE uint16s, the
+        // reserved0 alignment byte, the 0xFF "no pin" sentinel) is defined
+        // in exactly one place.
+        const int OffsetDacHwMute = 2944;
+        if (p.FormatVersion >= 10 && buffer.Length >= OffsetDacHwMute + DacHwMuteConfig.WireSize)
+        {
+            p.DacHwMute = DacHwMuteConfig.TryParse(buffer, OffsetDacHwMute);
+            p.HasDacHwMute = p.DacHwMute != null;
         }
 
         return p;

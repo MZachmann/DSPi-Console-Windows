@@ -115,20 +115,22 @@ public sealed class DacHwMuteConfig : IEquatable<DacHwMuteConfig>
     }
 
     /// <summary>Parse from a firmware-returned wire buffer. Accepts buffers
-    /// of <see cref="WireSize"/> or larger (extra bytes are ignored). Returns
+    /// of <see cref="WireSize"/> or larger at the given offset (extra bytes
+    /// after the section are ignored — bulk-fetch callers pass the whole
+    /// REQ_GET_ALL_PARAMS packet plus the section offset). Returns
     /// <c>null</c> if the buffer is too short — caller should treat that as
     /// "DAC HW mute not supported on this firmware" (older devices STALL the
     /// GET opcode and the USB layer returns null/empty).</summary>
-    public static DacHwMuteConfig? TryParse(byte[]? data)
+    public static DacHwMuteConfig? TryParse(byte[]? data, int offset = 0)
     {
-        if (data == null || data.Length < WireSize) return null;
+        if (data == null || offset < 0 || data.Length < offset + WireSize) return null;
         return new DacHwMuteConfig
         {
-            Enabled = data[0] != 0,
-            ActiveLow = data[1] != 0,
-            Pin = data[2],
-            HoldMs = (ushort)(data[4] | (data[5] << 8)),
-            ReleaseMs = (ushort)(data[6] | (data[7] << 8)),
+            Enabled = data[offset + 0] != 0,
+            ActiveLow = data[offset + 1] != 0,
+            Pin = data[offset + 2],
+            HoldMs = (ushort)(data[offset + 4] | (data[offset + 5] << 8)),
+            ReleaseMs = (ushort)(data[offset + 6] | (data[offset + 7] << 8)),
         };
     }
 

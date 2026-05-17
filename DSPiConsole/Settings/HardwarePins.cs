@@ -109,11 +109,18 @@ internal static class HardwarePins
         // (or I²S DOUT); id 4 (RP2350) / id 2 (RP2040) is PDM. The
         // excludeOutputId guard keeps a row's own pin pickable on its
         // own combo.
+        //
+        // Use Detail ("OUT 1/2", "SUB OUT", …) rather than Name
+        // ("Output 1", "PDM") because every consumer of this map shows
+        // the value in a pin-conflict label — and Detail names the
+        // actual signal that's on the GPIO, which is what the user
+        // needs to know to resolve the conflict. Name is the row
+        // header in the Output Assignment editor only.
         var outputs = AllPinOutputs(vm.Platform);
         foreach (var o in outputs)
         {
             if (o.Id == excludeOutputId) continue;
-            owners[vm.GetOutputPinValue(o.Id)] = o.Name;
+            owners[vm.GetOutputPinValue(o.Id)] = o.Detail;
         }
 
         // I²S clock pins: BCK reserves both pin and pin+1 (LRCK).

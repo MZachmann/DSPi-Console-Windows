@@ -78,9 +78,13 @@
                  surface that owns the Apply/Discard action; closing
                  it would orphan the pending state. -->
             <!-- InfoBar.ActionButton is typed as a single Button, so the
-                 Discard / Apply pair lives in the Content slot instead.
-                 The result visually reads the same: title on the left,
-                 message below, action buttons on the right of the body. -->
+                 explanation text + Discard / Save-to-flash pair live in
+                 the Content slot instead. The clarifying sentence above
+                 the buttons spells out that these settings write through
+                 to device flash and apply globally — the user can't
+                 confuse them with per-preset state.
+                 The accent button reads "Save to flash" rather than the
+                 generic "Apply" for the same reason. -->
             <InfoBar x:Name="PendingBar"
                      Grid.Row="0"
                      Margin="24,16,24,0"
@@ -89,14 +93,20 @@
                      IsClosable="False"
                      Title="Pending device changes"
                      Message="0 pending changes">
-                <StackPanel Orientation="Horizontal" Spacing="8" Margin="0,8,0,4">
-                    <Button x:Name="DiscardButton"
-                            Content="Discard"
-                            Click="OnDiscardClick"/>
-                    <Button x:Name="ApplyButton"
-                            Content="Apply"
-                            Style="{ThemeResource AccentButtonStyle}"
-                            Click="OnApplyClick"/>
+                <StackPanel Spacing="8" Margin="0,8,0,4">
+                    <TextBlock Text="These settings are written directly to device flash and apply globally — they are independent of the currently loaded preset."
+                               TextWrapping="Wrap"
+                               FontSize="12"
+                               Foreground="{ThemeResource TextFillColorSecondaryBrush}"/>
+                    <StackPanel Orientation="Horizontal" Spacing="8">
+                        <Button x:Name="DiscardButton"
+                                Content="Discard"
+                                Click="OnDiscardClick"/>
+                        <Button x:Name="ApplyButton"
+                                Content="Save to flash"
+                                Style="{ThemeResource AccentButtonStyle}"
+                                Click="OnApplyClick"/>
+                    </StackPanel>
                 </StackPanel>
             </InfoBar>
 

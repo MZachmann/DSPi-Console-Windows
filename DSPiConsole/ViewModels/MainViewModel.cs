@@ -442,8 +442,12 @@ public partial class MainViewModel : ObservableObject, IDisposable
                             FetchPresetInfo();
                             FetchInputSource();
                             FetchBandBypassCapability();
-                            FetchDacHwMute();
-                            FetchLgSoundSync();
+                            // DAC HW mute (V10+) and LG Sound Sync (V8+)
+                            // arrive via the bulk packet's WireDacHwMute /
+                            // WireLgSoundSync sections — ApplyBulkParams
+                            // sets *Supported and the live config. The
+                            // FetchAll legacy fallback covers the pre-V2
+                            // edge case explicitly.
                             _dispatcher.TryEnqueue(() =>
                             {
                                 // Seed the notified-source tracker so the first
@@ -573,6 +577,14 @@ public partial class MainViewModel : ObservableObject, IDisposable
             if (!IsDeviceConnected) return;
             Task.Run(() =>
             {
+                // Mirror LoadPreset's pattern: every property setter fired by
+                // FetchAll calls CheckDirty in its partial method, and without
+                // this gate each one would diff the in-flight new state against
+                // the still-old _savedSnapshot and flip PresetsDirty true for
+                // the dispatcher tick or two before the cleanup block below
+                // resets it — visible as a ~300ms dirty flash whenever the
+                // firmware emits BULK_INVALIDATED(Preset) for a preset switch.
+                _suppressDirtyCheck = true;
                 FetchAll();
                 _dispatcher.TryEnqueue(() =>
                 {
@@ -580,11 +592,16 @@ public partial class MainViewModel : ObservableObject, IDisposable
                     {
                         UpdateSavedSnapshot();
                         PresetsDirty = false;
+                        _suppressDirtyCheck = false;
                     }
                     else
                     {
                         // Field values may have changed during FetchAll; re-
-                        // compute dirty against the existing baseline.
+                        // compute dirty against the existing baseline. Must
+                        // clear the suppression BEFORE the CheckDirty call,
+                        // otherwise CheckDirty short-circuits and the host-
+                        // initiated edit's dirty bit never lights up.
+                        _suppressDirtyCheck = false;
                         CheckDirty();
                     }
                 });
@@ -1031,17 +1048,22 @@ public partial class MainViewModel : ObservableObject, IDisposable
                 if (parsed != null)
                 {
                     ApplyBulkParams(parsed);
-                    // Bulk parser doesn't yet decode the V9+ WireUserVolume
-                    // section, so pull it via the dedicated control transfer.
-                    // Older firmware STALLs and leaves UserVolumeDb at 0.
-                    FetchUserVolume();
                     return;
                 }
             }
 
-            // Fallback to legacy per-command fetching
+            // Fallback to legacy per-command fetching. Exercised when 0xA0
+            // STALLs (pre-V2 firmware) or the parser rejects the response.
+            // The V8+/V9+/V10+ feature fetches use dedicated opcodes that
+            // STALL gracefully on older firmware (leaving *Supported = false),
+            // so calling them unconditionally here is correct for both cases:
+            // ancient firmware sees a clean "unsupported", and modern firmware
+            // with a transient bulk-fetch failure still gets its state filled
+            // in from the per-feature getters.
             FetchAllLegacy();
             FetchUserVolume();
+            FetchLgSoundSync();
+            FetchDacHwMute();
         }
         catch { }
     }
@@ -1205,6 +1227,49 @@ public partial class MainViewModel : ObservableObject, IDisposable
                 LevellerMaxGainDb = bp.LevellerMaxGainDb;
                 LevellerLookahead = bp.LevellerLookahead;
                 LevellerGateDb = bp.LevellerGateDb;
+            }
+
+            // V8+ LG Sound Sync. HasLgSoundSync mirrors what the dedicated
+            // 0xE7 fetch would tell us — when the bulk packet carries the
+            // section, the firmware supports the feature, and vice versa.
+            // The [ObservableProperty] equality check on the LgSoundSyncEnabled
+            // setter means an unchanged value won't re-trigger the partial
+            // OnLgSoundSyncEnabledChanged (which would write back via 0xE6).
+            if (bp.HasLgSoundSync)
+            {
+                LgSoundSyncSupported = true;
+                LgSoundSyncEnabled = bp.LgSoundSyncEnabled;
+            }
+            else
+            {
+                LgSoundSyncSupported = false;
+            }
+
+            // V9+ user volume. UserVolumeDb's partial setter normally writes
+            // back via REQ_SET_USER_VOLUME (0xDA), which would round-trip the
+            // value we just read. Suppress the write-back for the duration of
+            // the assignment — the same flag the host-volume / GPIO-knob
+            // notify paths use (see OnUserVolumeDbChanged at line 1825).
+            if (bp.HasUserVolume && Math.Abs(UserVolumeDb - bp.UserVolumeDb) > 0.05f)
+            {
+                _suppressUserVolumeSend = true;
+                try { UserVolumeDb = bp.UserVolumeDb; }
+                finally { _suppressUserVolumeSend = false; }
+            }
+
+            // V10+ external DAC hardware mute. The DacHwMute property has no
+            // partial setter so there's no write-back to suppress — assigning
+            // a structurally-equal instance is a no-op courtesy of
+            // DacHwMuteConfig.Equals.
+            if (bp.HasDacHwMute && bp.DacHwMute != null)
+            {
+                DacHwMuteSupported = true;
+                if (!bp.DacHwMute.Equals(DacHwMute))
+                    DacHwMute = bp.DacHwMute;
+            }
+            else
+            {
+                DacHwMuteSupported = false;
             }
         });
     }

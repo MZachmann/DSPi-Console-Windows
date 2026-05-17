@@ -2310,7 +2310,12 @@ public sealed partial class MainWindow : Window
 
     private static double QuantizeDb(double db, double quantum)
     {
-        return Math.Round(db / quantum) * quantum;
+        var q = Math.Round(db / quantum) * quantum;
+        // IEEE 754 keeps the sign bit through Math.Round, so a tiny negative
+        // input (e.g. -60 * 0^curve = -0.0 at the top of the log taper, or a
+        // -0.0001 echoed back from firmware quantization) rounds to -0.0 and
+        // formats as "-0 dB". Add 0.0 to canonicalize: -0.0 + 0.0 = +0.0.
+        return q == 0.0 ? 0.0 : q;
     }
 
     private static double UserVolumeDbToSliderPos(double db)
