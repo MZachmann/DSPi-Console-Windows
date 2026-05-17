@@ -211,16 +211,13 @@ public sealed partial class MainWindow : Window
 
 
         // Right-click slider to reset. Master: snap back to the saved snapshot
-        // value (or 0 if no snapshot yet). User (host): scalar 1.0 (0 dB at the
-        // endpoint) — matches macOS HostVolumeSection.onRightClick. User
-        // (firmware): 0 dB, matches macOS UserVolumeSection.onRightClick.
+        // value (or 0 if no snapshot yet). User: 0 dB via REQ_SET_USER_VOLUME,
+        // matches macOS UserVolumeSection.onRightClick.
         MasterVolumeSlider.RightTapped += (s, e) =>
         {
             e.Handled = true;
             if (_sidebarVolumeIsMaster)
                 ViewModel.MasterVolumeDb = ViewModel.SavedSnapshot?.MasterVolumeDb ?? 0f;
-            else if (UseHostVolume)
-                ViewModel.HostVolume.SetVolumeScalar(1.0f);
             else
                 ViewModel.UserVolumeDb = 0f;
         };
@@ -257,15 +254,6 @@ public sealed partial class MainWindow : Window
         };
         ViewModel.AvailableDevices.CollectionChanged += (s, e) =>
             DispatcherQueue.TryEnqueue(UpdateDeviceSelector);
-
-        // External Windows-side volume changes (system tray, hardware volume
-        // keys, other apps, default-device switch) push back into our slider
-        // when in host-volume mode. The service already dispatches to the UI
-        // thread and suppresses echoes of our own writes.
-        ViewModel.HostVolume.VolumeChanged += (_, _) =>
-        {
-            if (UseHostVolume) UpdateMasterVolumeDisplay();
-        };
 
         // Initial UI state
         UpdateConnectionStatus();
@@ -2044,10 +2032,6 @@ public sealed partial class MainWindow : Window
                     break;
                 case nameof(MainViewModel.MasterVolumeDb):
                 case nameof(MainViewModel.UserVolumeDb):
-                case nameof(MainViewModel.ActiveInputSource):
-                    // ActiveInputSource flips toggle UseHostVolume, which
-                    // changes which source backs the slider — refresh the
-                    // display so the slider/readout jump to the right value.
                     UpdateMasterVolumeDisplay();
                     break;
                 case nameof(MainViewModel.InputPreampLDb):
@@ -2271,60 +2255,92 @@ public sealed partial class MainWindow : Window
         _inputPreampValueText.Text = $"{v:F1} dB";
     }
 
-    // Discrete master-volume taper:
-    //   0 to -30 dB in 0.5 dB steps (loudest region, fine resolution)
-    //   -30 to -60 dB in 1 dB steps
-    //   -60 to -128 dB in 5 dB steps, with -128 reserved as mute sentinel
-    // Position 0 = -128 (mute), position Max = 0 dB.
-    private static readonly float[] MasterVolumeSteps = BuildMasterVolumeSteps();
-    private static float[] BuildMasterVolumeSteps()
+    // ── Volume slider taper (user + master) ─────────────────────────────────
+    //
+    // Continuous log-shaped curve shared by both modes — same dB lives at the
+    // same slider position regardless of which mode is active. With curve =
+    // log2(3) ≈ 1.585, the top 50% covers exactly 0…-20 dB.
+    //
+    //   pos_norm = 1 - (-db / -min_db)^(1/curve)
+    //   db       = min_db * (1 - pos_norm)^curve
+    //
+    // The slider uses a wide integer range (VolumeSliderMax = 1000 ticks) so
+    // dragging feels smooth even with a piecewise-zero second derivative; the
+    // dB value sent to firmware is snapped to a coarser quantum:
+    //   • user volume   → 1.0 dB (matches firmware's preset vol_index storage,
+    //                     avoiding the save/reload rounding step)
+    //   • master volume → 0.5 dB (matches the prior discrete taper's resolution
+    //                     in the loud region)
+    //
+    // Master mode reserves slider position 0 for the -128 dB mute sentinel.
+    // Positions [1, VolumeSliderMax] map to the same log curve over [-60, 0]
+    // that user mode uses, so the visible scale is identical between modes;
+    // dragging onto position 0 snaps to mute. The firmware's master-volume
+    // range below -60 dB is not reachable through this slider — sub-60 dB
+    // masters are an inaudible / pre-mute region and the mute sentinel covers
+    // "silence" cleanly.
+    private const double VolumeMinDb             = -60.0;
+    private const double VolumeMaxDb             = 0.0;
+    private const double MasterVolumeMuteDb      = -128.0;   // sentinel below the log range
+    private const double LogTaperCurve           = 1.5849625007211563;  // log2(3) → -20 dB at pos 50%
+    private const double VolumeSliderMax         = 1000.0;
+    private const double UserVolumeQuantumDb     = 1.0;
+    private const double MasterVolumeQuantumDb   = 0.5;
+
+    // Kept as aliases so older references in this file still compile if any
+    // were missed during the refactor; both ranges are now identical.
+    private const double UserVolumeMinDb   = VolumeMinDb;
+    private const double UserVolumeMaxDb   = VolumeMaxDb;
+
+    // dB → normalized 0..1 position along the log curve.
+    private static double LogTaperDbToNormalized(double db, double minDb)
     {
-        var list = new List<float> { -128f };
-        for (float db = -125f; db <= -65f + 0.001f; db += 5f) list.Add(db);
-        for (float db = -60f; db <= -31f + 0.001f; db += 1f) list.Add(db);
-        for (float db = -30f; db <= 0f + 0.001f; db += 0.5f) list.Add(MathF.Round(db, 1));
-        return list.ToArray();
+        if (db >= 0.0) return 1.0;
+        if (db <= minDb) return 0.0;
+        double ratio = db / minDb;                       // 0..1, 0 at top
+        return 1.0 - Math.Pow(ratio, 1.0 / LogTaperCurve);
     }
 
-    private static int MasterVolumeDbToSliderPos(double db)
+    // Normalized 0..1 → dB along the log curve.
+    private static double LogTaperNormalizedToDb(double posNorm, double minDb)
     {
-        int best = 0;
-        double bestDelta = double.MaxValue;
-        for (int i = 0; i < MasterVolumeSteps.Length; i++)
-        {
-            double d = Math.Abs(MasterVolumeSteps[i] - db);
-            if (d < bestDelta) { bestDelta = d; best = i; }
-        }
-        return best;
+        var clamped = Math.Clamp(posNorm, 0.0, 1.0);
+        return minDb * Math.Pow(1.0 - clamped, LogTaperCurve);
     }
 
-    private static double MasterVolumeSliderPosToDb(double pos)
+    private static double QuantizeDb(double db, double quantum)
     {
-        int idx = Math.Clamp((int)Math.Round(pos), 0, MasterVolumeSteps.Length - 1);
-        return MasterVolumeSteps[idx];
+        return Math.Round(db / quantum) * quantum;
     }
-
-    // User-volume and host-volume modes share one taper: linear in dB at 1 dB
-    // per slider step over [-60, 0]. The slider's Maximum is switched to
-    // UserVolumeSliderMax (=60) when entering either mode, so dragging snaps
-    // to integer-dB positions and the same dB sits at the same visual
-    // location regardless of whether we're driving REQ_SET_USER_VOLUME or
-    // the Windows host endpoint. No mute sentinel — the bottom reads -60 dB.
-    private const double UserVolumeMinDb = -60.0;
-    private const double UserVolumeMaxDb = 0.0;
-    private const double UserVolumeSliderMax = 60.0;
-    private const double MasterVolumeSliderMax = 104.0;
 
     private static double UserVolumeDbToSliderPos(double db)
     {
-        var clamped = Math.Clamp(db, UserVolumeMinDb, UserVolumeMaxDb);
-        return clamped - UserVolumeMinDb;
+        var norm = LogTaperDbToNormalized(Math.Clamp(db, VolumeMinDb, VolumeMaxDb), VolumeMinDb);
+        return norm * VolumeSliderMax;
     }
 
     private static double UserVolumeSliderPosToDb(double pos)
     {
-        var clamped = Math.Clamp(pos, 0, UserVolumeSliderMax);
-        return UserVolumeMinDb + clamped;
+        var clamped = Math.Clamp(pos, 0, VolumeSliderMax);
+        var db = LogTaperNormalizedToDb(clamped / VolumeSliderMax, VolumeMinDb);
+        return QuantizeDb(db, UserVolumeQuantumDb);
+    }
+
+    private static double MasterVolumeDbToSliderPos(double db)
+    {
+        if (db <= MasterVolumeMuteDb + 0.5) return 0.0;  // mute sentinel sits at the bottom tick
+        var norm = LogTaperDbToNormalized(Math.Clamp(db, VolumeMinDb, VolumeMaxDb), VolumeMinDb);
+        // Reserve position 0 for mute; the log curve spans [1, VolumeSliderMax].
+        return 1.0 + norm * (VolumeSliderMax - 1.0);
+    }
+
+    private static double MasterVolumeSliderPosToDb(double pos)
+    {
+        var clamped = Math.Clamp(pos, 0, VolumeSliderMax);
+        if (clamped < 1.0) return MasterVolumeMuteDb;
+        var posNorm = (clamped - 1.0) / (VolumeSliderMax - 1.0);
+        var db = LogTaperNormalizedToDb(posNorm, VolumeMinDb);
+        return QuantizeDb(db, MasterVolumeQuantumDb);
     }
 
     private bool _updatingMasterVolumeSlider;
@@ -2332,19 +2348,6 @@ public sealed partial class MainWindow : Window
 
     // macOS systemRed-ish; reads well against the dark acrylic sidebar.
     private static readonly Color SidebarVolumeMasterTint = Color.FromArgb(255, 230, 70, 60);
-
-    /// <summary>
-    /// True when the sidebar slider should drive the Windows system-default render
-    /// endpoint (via <see cref="HostVolumeService"/>) instead of REQ_SET_USER_VOLUME.
-    /// Mirrors macOS's "Host Volume" mode: User Volume picked + DSPi input source
-    /// == USB + a default endpoint is bound. When DSPi is the current playback
-    /// device the same endpoint backs both our slider and the system-tray slider,
-    /// so they stay in lockstep automatically.
-    /// </summary>
-    private bool UseHostVolume =>
-        !_sidebarVolumeIsMaster
-        && ViewModel.ActiveInputSource == InputSource.Usb
-        && ViewModel.HostVolume.IsAvailable;
 
     /// <summary>
     /// Apply the chosen sidebar volume mode: rewrite the label, toggle the
@@ -2364,14 +2367,10 @@ public sealed partial class MainWindow : Window
             : (Color)Application.Current.Resources["SystemAccentColor"];
         SetSidebarSliderTint(tint);
 
-        // Switch the slider range to match the active taper. Master keeps its
-        // piecewise 0..104 mapping; user/host modes use 0..60 (1 dB per step).
-        // Set Maximum before UpdateMasterVolumeDisplay so its position
-        // calculation lands inside the new range.
-        var newMax = isMaster ? MasterVolumeSliderMax : UserVolumeSliderMax;
-        if (Math.Abs(MasterVolumeSlider.Maximum - newMax) > 0.01)
-            MasterVolumeSlider.Maximum = newMax;
-
+        // Both modes share the same log-tapered slider range (0..VolumeSliderMax);
+        // only the underlying dB↔position mapping differs (user covers [-60, 0],
+        // master covers [-125, 0] with a mute sentinel at position 0). XAML sets
+        // Maximum once to VolumeSliderMax, so there's nothing to switch here.
         UpdateMasterVolumeDisplay();
 
         if (persist && AppSettings.Instance.SidebarVolumeMode != (isMaster ? "master" : "user"))
@@ -2398,8 +2397,7 @@ public sealed partial class MainWindow : Window
     /// <summary>
     /// Refresh the slider position and dB readout from whichever source the
     /// current mode tracks. Called whenever MasterVolumeDb / UserVolumeDb
-    /// change, the host endpoint reports a change, the active input source
-    /// flips, or the mode itself toggles.
+    /// change or the mode itself toggles.
     /// </summary>
     private void UpdateMasterVolumeDisplay()
     {
@@ -2410,38 +2408,27 @@ public sealed partial class MainWindow : Window
             {
                 var v = ViewModel.MasterVolumeDb;
                 var pos = MasterVolumeDbToSliderPos(v);
-                if (Math.Abs(MasterVolumeSlider.Value - pos) > 0.5)
+                // 1-tick tolerance — the slider snaps to integer positions, so
+                // any difference smaller than that is just the round-trip
+                // through QuantizeDb (e.g., a preset-loaded -12.3 will round
+                // to -12.5, which is a positional drift well under one tick).
+                if (Math.Abs(MasterVolumeSlider.Value - pos) > 1.0)
                     MasterVolumeSlider.Value = pos;
-                MasterVolumeValueText.Text = v <= -127.5f ? "-inf dB" : $"{v:F1} dB";
-            }
-            else if (UseHostVolume)
-            {
-                // Linear-in-dB at 1 dB per slider step. Round whatever the
-                // endpoint reports to the nearest integer so the slider thumb
-                // and the readout always agree — sub-dB endpoint quantization
-                // and external fractional writes get snapped for display.
-                var db = ViewModel.HostVolume.VolumeDb;
-                if (float.IsNegativeInfinity(db))
-                {
-                    MasterVolumeSlider.Value = 0;
-                    MasterVolumeValueText.Text = "-inf dB";
-                }
-                else
-                {
-                    var rounded = Math.Round(Math.Clamp((double)db, UserVolumeMinDb, UserVolumeMaxDb));
-                    MasterVolumeSlider.Value = UserVolumeDbToSliderPos(rounded);
-                    MasterVolumeValueText.Text = $"{rounded:F0} dB";
-                }
+                MasterVolumeValueText.Text = v <= MasterVolumeMuteDb + 0.5
+                    ? "-inf dB" : $"{v:F1} dB";
             }
             else
             {
-                // Same 1 dB-per-step taper as host mode. Round for display so
-                // a preset-loaded fractional value doesn't show a stray decimal
-                // while the slider sits at the nearest integer position.
-                var rounded = Math.Round(Math.Clamp((double)ViewModel.UserVolumeDb,
-                                                    UserVolumeMinDb, UserVolumeMaxDb));
-                MasterVolumeSlider.Value = UserVolumeDbToSliderPos(rounded);
-                MasterVolumeValueText.Text = $"{rounded:F0} dB";
+                // Snap the displayed value through the same quantum the taper
+                // uses on output (1 dB for user volume) so a preset-loaded
+                // fractional value lands on a clean readout immediately.
+                var quantized = QuantizeDb(Math.Clamp((double)ViewModel.UserVolumeDb,
+                                                     UserVolumeMinDb, UserVolumeMaxDb),
+                                           UserVolumeQuantumDb);
+                var pos = UserVolumeDbToSliderPos(quantized);
+                if (Math.Abs(MasterVolumeSlider.Value - pos) > 1.0)
+                    MasterVolumeSlider.Value = pos;
+                MasterVolumeValueText.Text = $"{quantized:F0} dB";
             }
         }
         finally
@@ -2605,23 +2592,19 @@ public sealed partial class MainWindow : Window
             float db = (float)MasterVolumeSliderPosToDb(e.NewValue);
             if (Math.Abs(ViewModel.MasterVolumeDb - db) > 0.05f)
                 ViewModel.MasterVolumeDb = db;
-            MasterVolumeValueText.Text = db <= -127.5f ? "-inf dB" : $"{db:F1} dB";
-        }
-        else if (UseHostVolume)
-        {
-            // Drive the Windows endpoint at integer dB. The firmware's
-            // audio_state.volume gets updated automatically via the UAC1
-            // protocol mirror, so we skip the redundant REQ_SET_USER_VOLUME
-            // write. Endpoint echo lands in HostVolume.VolumeChanged; the
-            // service's echo suppression keeps a rapid drag from fighting
-            // itself.
-            float db = (float)Math.Round(UserVolumeSliderPosToDb(e.NewValue));
-            ViewModel.HostVolume.SetVolumeDb(db);
-            MasterVolumeValueText.Text = $"{db:F0} dB";
+            MasterVolumeValueText.Text = db <= MasterVolumeMuteDb + 0.5
+                ? "-inf dB" : $"{db:F1} dB";
         }
         else
         {
-            float db = (float)Math.Round(UserVolumeSliderPosToDb(e.NewValue));
+            // User volume drives the firmware's audio_state.volume directly
+            // via REQ_SET_USER_VOLUME (0xDA). On USB the UAC1 host mirror
+            // also writes that field from the system-tray slider; the two
+            // writers coexist (last write wins) and firmware notifications
+            // keep this slider in sync with external changes.
+            // UserVolumeSliderPosToDb already snaps to UserVolumeQuantumDb,
+            // so no extra rounding here.
+            float db = (float)UserVolumeSliderPosToDb(e.NewValue);
             if (Math.Abs(ViewModel.UserVolumeDb - db) > 0.05f)
                 ViewModel.UserVolumeDb = db;
             MasterVolumeValueText.Text = $"{db:F0} dB";

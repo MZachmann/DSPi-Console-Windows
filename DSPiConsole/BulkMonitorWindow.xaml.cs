@@ -659,6 +659,7 @@ internal static class NotifyPacketDecoder
         4 => "Factory",
         5 => "Gpio",
         6 => "Internal",
+        7 => "Uac1",
         _ => $"src({src})"
     };
 

@@ -84,6 +84,13 @@ public partial class MainViewModel : ObservableObject, IDisposable
     // true. FetchAll callers set this, then clear it after UpdateSavedSnapshot.
     private volatile bool _suppressDirtyCheck;
 
+    // Set while applying a user-volume change pushed FROM the firmware (UAC1
+    // host echo, GPIO knob, etc.) so OnUserVolumeDbChanged skips the
+    // REQ_SET_USER_VOLUME round-trip. Both written and read on the UI
+    // dispatcher inside the same synchronous setter→partial-method chain,
+    // so no volatility is needed.
+    private bool _suppressUserVolumeSend;
+
     // Channel copy/paste clipboard
     private ChannelClipboard? _channelClipboard;
     public bool HasChannelClipboard => _channelClipboard != null;
@@ -198,6 +205,18 @@ public partial class MainViewModel : ObservableObject, IDisposable
     [ObservableProperty]
     private bool _dacHwMuteSupported;
 
+    // LG Sound Sync (firmware V8+). Per-preset enable flag; the firmware
+    // decodes the TV's TOSLINK volume / mute messages and applies them through
+    // the user-volume path. Probe at connect via REQ_GET_LG_SOUND_SYNC_ENABLE
+    // (0xE7); older firmware STALLs and the SPDIF Input settings page hides
+    // the toggle accordingly. Runtime status fields (present, volume, muted)
+    // aren't exposed here — only the user-writable enable matters for the UI.
+    [ObservableProperty]
+    private bool _lgSoundSyncEnabled;
+
+    [ObservableProperty]
+    private bool _lgSoundSyncSupported;
+
     // Tracks the source value the firmware most recently *notified* us about
     // (i.e. landed in its main loop). Distinct from ActiveInputSource, which
     // is preemptively updated by SetInputSourceAsync's read-back before the
@@ -205,13 +224,6 @@ public partial class MainViewModel : ObservableObject, IDisposable
     // transition from the reconciliation check below.
     private readonly object _lastNotifiedSourceLock = new();
     private InputSource? _lastNotifiedSource;
-
-    // When the SPDIF→USB reconciliation can't run immediately (no audio
-    // endpoint bound yet — the default render device is something other than
-    // DSPi, or DSPi was just hot-plugged and Windows hasn't bound it),
-    // we stash the value here and flush it when HostVolume next becomes
-    // available. Updated and read only on the UI dispatcher thread.
-    private float? _pendingHostVolumePush;
 
     [ObservableProperty]
     private InputSource _activeInputSource = InputSource.Usb;
@@ -384,21 +396,10 @@ public partial class MainViewModel : ObservableObject, IDisposable
     public byte SpdifRxPin => _spdifRxPin;
     public bool AnySlotIsI2S => _outputSlotTypes.Take(NumOutputSlots).Any(t => t == OutputSlotType.I2S);
 
-    /// <summary>
-    /// Bidirectional bridge to the Windows system default render endpoint (the
-    /// volume the system-tray slider controls). Used by the sidebar slider when
-    /// in "User Volume" mode while the DSPi input source is USB — drags push
-    /// the host endpoint via WASAPI, and changes from anywhere else (system
-    /// tray, hardware volume keys, other apps) flow back into our slider.
-    /// </summary>
-    public HostVolumeService HostVolume { get; }
-
     public MainViewModel()
     {
         _dispatcher = DispatcherQueue.GetForCurrentThread();
         _device = new DspDevice();
-        HostVolume = new HostVolumeService(_dispatcher);
-        HostVolume.Start();
 
         // Initialize channel data
         foreach (var channel in Channel.All)
@@ -442,6 +443,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
                             FetchInputSource();
                             FetchBandBypassCapability();
                             FetchDacHwMute();
+                            FetchLgSoundSync();
                             _dispatcher.TryEnqueue(() =>
                             {
                                 // Seed the notified-source tracker so the first
@@ -527,6 +529,29 @@ public partial class MainViewModel : ObservableObject, IDisposable
             });
         };
 
+        // User-volume change pushed from the device. The firmware tags:
+        //   • HostSet — echo of our own REQ_SET_USER_VOLUME write; UserVolumeDb
+        //               already holds this value, so the notification is
+        //               redundant. Drop it.
+        //   • Uac1    — UAC1 Feature Unit SET_CUR from the OS (system tray
+        //               slider, keyboard volume keys); update UserVolumeDb so
+        //               the sidebar slider tracks the OS volume live.
+        //   • Other   — Preset / BulkSet / Gpio / Internal; apply as well.
+        // For non-HostSet sources we set _suppressUserVolumeSend before writing
+        // UserVolumeDb so OnUserVolumeDbChanged doesn't round-trip the value
+        // back to firmware.
+        _device.UserVolumeNotified += (_, n) =>
+        {
+            if (n.Source == ParamSource.HostSet) return;
+            _dispatcher.TryEnqueue(() =>
+            {
+                if (Math.Abs(UserVolumeDb - n.Db) <= 0.05f) return;
+                _suppressUserVolumeSend = true;
+                try { UserVolumeDb = n.Db; }
+                finally { _suppressUserVolumeSend = false; }
+            });
+        };
+
         // BULK_INVALIDATED is the firmware's "I changed many things at once,
         // re-read the full state" signal. It comes from several origins:
         //   • Preset / Factory  → a NEW baseline was loaded; reset the saved
@@ -584,66 +609,27 @@ public partial class MainViewModel : ObservableObject, IDisposable
             }
 
             // Fetch the firmware's user_volume on the notify thread BEFORE we
-            // dispatch any UI state changes. This single ~5 ms control transfer
-            // lets us push the host endpoint and update UserVolumeDb in the
-            // same dispatcher tick as ActiveInputSource — so the first
-            // UpdateMasterVolumeDisplay triggered by the source change reads
-            // already-correct values and the sidebar slider renders once at
-            // the right position instead of snapping through a stale one.
-            // Both transition directions get the fresh value; only SPDIF → USB
-            // additionally pushes it to the Windows endpoint.
+            // dispatch any UI state changes. The sidebar slider tracks
+            // UserVolumeDb directly, so resyncing it in the same dispatcher
+            // tick as ActiveInputSource keeps the slider from snapping
+            // through a stale value when the source changes.
+            //
+            // previousSource is unused now that we no longer push anything
+            // to the Windows endpoint — kept the variable for parity with
+            // the firmware-side notification, in case future logic needs it.
+            _ = previousSource;
             var uv = _device.GetUserVolume();
-            bool reconcileToHost = uv.HasValue
-                && previousSource == InputSource.Spdif
-                && newSource == InputSource.Usb;
 
             _dispatcher.TryEnqueue(() =>
             {
-                // 1. Push to the host endpoint FIRST so HostVolume.VolumeDb is
-                //    fresh by the time step 3's PropertyChanged ripple reads it.
-                //    If the endpoint isn't bound right now (default device is
-                //    something other than DSPi, or DSPi was just hot-plugged
-                //    and Windows hasn't bound it yet), queue the value — the
-                //    HostVolume.VolumeChanged handler below flushes it the
-                //    moment IsAvailable goes true. No arbitrary timer needed.
-                if (reconcileToHost)
-                {
-                    if (HostVolume.IsAvailable)
-                        HostVolume.SetVolumeDb(uv!.Value);
-                    else
-                        _pendingHostVolumePush = uv!.Value;
-                }
-
-                // 2. Update UserVolumeDb. If we're still in the old (firmware-
-                //    user) mode the PropertyChanged-driven display rebuild
-                //    reads this directly; if we're flipping into host mode
-                //    that read happens on step 3 instead.
                 if (uv.HasValue && Math.Abs(UserVolumeDb - uv.Value) > 0.1f)
                     UserVolumeDb = uv.Value;
 
-                // 3. Flip ActiveInputSource last. This is what changes
-                //    UseHostVolume and triggers the final UpdateMasterVolumeDisplay.
                 if (ActiveInputSource != newSource)
                     ActiveInputSource = newSource;
                 InputSourceSupported = true;
                 InputSourceChanged?.Invoke(this, EventArgs.Empty);
             });
-        };
-
-        // Flush a queued SPDIF→USB reconciliation when the host endpoint next
-        // becomes available. VolumeChanged fires from BindToCurrentDefault when
-        // the default render device is (re)bound, so this is the deterministic
-        // signal for "the endpoint we want to write to has just come up". The
-        // queue holds at most one value (last write wins); once flushed we
-        // clear it so subsequent unrelated VolumeChanged events are no-ops.
-        HostVolume.VolumeChanged += (_, _) =>
-        {
-            if (_pendingHostVolumePush.HasValue && HostVolume.IsAvailable)
-            {
-                var v = _pendingHostVolumePush.Value;
-                _pendingHostVolumePush = null;
-                HostVolume.SetVolumeDb(v);
-            }
         };
 
         // Status polling timer (60ms interval)
@@ -1838,10 +1824,23 @@ public partial class MainViewModel : ObservableObject, IDisposable
 
     partial void OnUserVolumeDbChanged(float value)
     {
-        // User volume range is [-60, 0]; firmware clamps but rounding here
-        // keeps the dB readout stable and matches MasterVolumeDb's precision.
-        var send = MathF.Round(Math.Clamp(value, -60f, 0f), 1);
-        Task.Run(() => _device.SetUserVolume(send));
+        // Skip the firmware write when the value originated from the device
+        // itself (UAC1 host change, GPIO knob, etc.) — the sidebar slider only
+        // transmits when the user is dragging it directly. CheckDirty still
+        // runs so the change still counts toward preset-dirty bookkeeping.
+        if (!_suppressUserVolumeSend)
+        {
+            // User volume range is [-60, 0]; firmware clamps but rounding here
+            // keeps the dB readout stable and matches MasterVolumeDb's precision.
+            var send = MathF.Round(Math.Clamp(value, -60f, 0f), 1);
+            Task.Run(() => _device.SetUserVolume(send));
+        }
+        CheckDirty();
+    }
+
+    partial void OnLgSoundSyncEnabledChanged(bool value)
+    {
+        Task.Run(() => _device.SetLgSoundSyncEnabled(value));
         CheckDirty();
     }
 
@@ -2131,6 +2130,37 @@ public partial class MainViewModel : ObservableObject, IDisposable
     }
 
     /// <summary>
+    /// Probe firmware support for LG Sound Sync (V8+, opcodes 0xE6/0xE7) and
+    /// pull the live enable state. Older firmware STALLs the GET so
+    /// <see cref="DspDevice.GetLgSoundSyncEnabled"/> returns null — we treat
+    /// that as "feature unsupported" and the Settings UI hides the toggle.
+    /// </summary>
+    public void FetchLgSoundSync()
+    {
+        try
+        {
+            var enabled = _device.GetLgSoundSyncEnabled();
+            _dispatcher.TryEnqueue(() =>
+            {
+                if (enabled.HasValue)
+                {
+                    LgSoundSyncSupported = true;
+                    if (LgSoundSyncEnabled != enabled.Value)
+                        LgSoundSyncEnabled = enabled.Value;
+                }
+                else
+                {
+                    LgSoundSyncSupported = false;
+                }
+            });
+        }
+        catch
+        {
+            _dispatcher.TryEnqueue(() => LgSoundSyncSupported = false);
+        }
+    }
+
+    /// <summary>
     /// Push a new <see cref="DacHwMuteConfig"/> to the device and optimistically
     /// update the local property. The firmware SET is fire-and-forget (see
     /// <see cref="DspDevice.SetDacHwMute"/>'s remarks), so a validation
@@ -2199,13 +2229,10 @@ public partial class MainViewModel : ObservableObject, IDisposable
             _device.SetInputSource(source);
             // Do NOT preemptively assign ActiveInputSource here — let the
             // firmware's InputSourceNotified callback drive that update once
-            // the apply lands. Setting it before the apply would change
-            // UseHostVolume and trigger UpdateMasterVolumeDisplay to read a
-            // stale HostVolume.VolumeDb, snapping the sidebar slider to the
-            // wrong position for ~10 ms before the SPDIF→USB reconciliation
-            // corrects it (visible as a brief jump). The source dropdown is
-            // already showing the user's choice from the click itself, so
-            // there's no UX cost to waiting.
+            // the apply lands. The notify path refetches user_volume so the
+            // sidebar slider lands at the right value in a single dispatcher
+            // tick. The source dropdown is already showing the user's choice
+            // from the click itself, so there's no UX cost to waiting.
             _dispatcher.TryEnqueue(() =>
             {
                 InputSourceChanged?.Invoke(this, EventArgs.Empty);
@@ -2565,7 +2592,6 @@ public partial class MainViewModel : ObservableObject, IDisposable
 
         _pollTimer.Stop();
         _pollTimer.Dispose();
-        HostVolume.Dispose();
         _device.Dispose();
 
         GC.SuppressFinalize(this);

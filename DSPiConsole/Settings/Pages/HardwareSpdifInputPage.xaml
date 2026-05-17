@@ -7,9 +7,14 @@
     xmlns:controls="using:CommunityToolkit.WinUI.Controls">
 
     <!--
-        Single-pin page. The RX pin is hot-swappable while active —
-        output briefly mutes during re-lock. Page only registered when
-        firmware V7+ exposes SPDIF input capability (see IsAvailable).
+        S/PDIF Input page. Two cards:
+          1. RX pin — hot-swappable while active; brief output mute on re-lock.
+          2. LG Sound Sync — V8+ firmware. Decodes the TV's TOSLINK volume /
+             mute messages and applies them through the user-volume path.
+             Card visibility tracks LgSoundSyncSupported; hidden on older
+             firmware so the section doesn't show a stuck toggle.
+        Page only registered when firmware V7+ exposes SPDIF input capability
+        (see IsAvailable).
     -->
     <StackPanel Spacing="4">
 
@@ -17,6 +22,14 @@
                                 Description="GPIO pin for the S/PDIF input receiver (default 11). Hot-swappable while active — output briefly mutes during re-lock.">
                         <ComboBox x:Name="SpdifRxPinCombo" MinWidth="140"
                       SelectionChanged="OnSpdifRxPinChanged"/>
+        </controls:SettingsCard>
+
+        <controls:SettingsCard x:Name="LgSoundSyncCard"
+                                Header="LG Sound Sync"
+                                Description="Decode the LG TV's TOSLINK side-channel for volume / mute commands and apply them through the user-volume path. Requires firmware V8 or newer.">
+            <ToggleSwitch x:Name="LgSoundSyncToggle"
+                          OnContent="On" OffContent="Off"
+                          Toggled="OnLgSoundSyncToggled"/>
         </controls:SettingsCard>
 
         <TextBlock x:Name="StatusText"

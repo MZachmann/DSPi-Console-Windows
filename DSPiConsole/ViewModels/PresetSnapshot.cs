@@ -13,6 +13,12 @@ public class PresetSnapshot
     public float InputPreampLDb;
     public float InputPreampRDb;
     public float MasterVolumeDb;
+    // V15+ preset slot persists audio_state.volume as user_vol_index. Captured
+    // unconditionally — unlike MasterVolumeDb, user volume isn't gated by a
+    // mode flag, the firmware always restores it on preset load (if the slot
+    // is V15+; pre-V15 slots leave it untouched, which is correct legacy
+    // behavior, but new slots written by current firmware always include it).
+    public float UserVolumeDb;
     public bool Bypass;
 
     public bool LoudnessEnabled;
@@ -55,6 +61,12 @@ public class PresetSnapshot
     // preset_load applies.
     public byte SpdifRxPin;
 
+    // LG Sound Sync enable (V8+ preset slot field). Only the user-writable
+    // `enabled` flag is preset state; runtime fields (present, volume, muted)
+    // are diagnostic and not captured. Tracks via REQ_SET/GET_LG_SOUND_SYNC
+    // (0xE6/0xE7) when the toggle moves and is honored on bulk SET.
+    public bool LgSoundSyncEnabled;
+
     /// <summary>
     /// Capture a snapshot from the current ViewModel state.
     /// </summary>
@@ -65,6 +77,7 @@ public class PresetSnapshot
             InputPreampLDb = vm.InputPreampLDb,
             InputPreampRDb = vm.InputPreampRDb,
             MasterVolumeDb = vm.MasterVolumeDb,
+            UserVolumeDb = vm.UserVolumeDb,
             Bypass = vm.Bypass,
             LoudnessEnabled = vm.LoudnessEnabled,
             LoudnessRefSpl = vm.LoudnessRefSPL,
@@ -142,6 +155,9 @@ public class PresetSnapshot
         // SPDIF RX pin (V13+ slot data — persists alongside output_pins)
         snap.SpdifRxPin = vm.SpdifRxPin;
 
+        // LG Sound Sync enable flag (V8+ preset slot field)
+        snap.LgSoundSyncEnabled = vm.LgSoundSyncEnabled;
+
         return snap;
     }
 }
@@ -176,6 +192,13 @@ public static class PresetDiff
             string FormatMv(float v) => v <= -127.5f ? "mute" : FormatDb(v);
             changes.Add($"Master volume: {FormatMv(old.MasterVolumeDb)} → {FormatMv(cur.MasterVolumeDb)}");
         }
+        // User volume is unconditionally per-preset on V15+ firmware. 0.5 dB
+        // threshold (vs. 0.05 elsewhere) absorbs the firmware's int-dB
+        // quantization — the slot stores vol_index in whole-dB steps, so a
+        // saved -12.0 reloads as exactly -12.0; we only care about real
+        // user-driven moves, not sub-dB ripples from notification echoes.
+        if (Math.Abs(old.UserVolumeDb - cur.UserVolumeDb) > 0.5f)
+            changes.Add($"User volume: {FormatDb(old.UserVolumeDb)} → {FormatDb(cur.UserVolumeDb)}");
         if (old.Bypass != cur.Bypass)
             changes.Add($"Master EQ bypass: {(old.Bypass ? "on" : "off")} \u2192 {(cur.Bypass ? "on" : "off")}");
 
@@ -314,6 +337,10 @@ public static class PresetDiff
         // SPDIF RX pin
         if (old.SpdifRxPin != cur.SpdifRxPin)
             changes.Add($"S/PDIF RX pin: GPIO {old.SpdifRxPin} → GPIO {cur.SpdifRxPin}");
+
+        // LG Sound Sync
+        if (old.LgSoundSyncEnabled != cur.LgSoundSyncEnabled)
+            changes.Add($"LG Sound Sync: {(cur.LgSoundSyncEnabled ? "enabled" : "disabled")}");
 
         return changes;
     }

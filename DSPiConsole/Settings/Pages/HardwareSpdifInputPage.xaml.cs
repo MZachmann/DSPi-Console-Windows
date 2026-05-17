@@ -37,10 +37,14 @@ public sealed partial class HardwareSpdifInputPage : SettingsModule, ISettingsPa
     {
         base.Attach(vm, tracker);
 
-        // Fetch from device on a background thread.
+        // Fetch from device on a background thread. Both calls share the
+        // same continuation — the page redraws once when either lands.
         var fetchVm = vm;
-        _ = Task.Run(() => fetchVm.FetchSpdifRxPin())
-            .ContinueWith(_ => DispatcherQueue.TryEnqueue(Refresh));
+        _ = Task.Run(() =>
+        {
+            fetchVm.FetchSpdifRxPin();
+            fetchVm.FetchLgSoundSync();
+        }).ContinueWith(_ => DispatcherQueue.TryEnqueue(Refresh));
     }
 
     private void OnPageLoaded(object sender, RoutedEventArgs e)
@@ -69,10 +73,15 @@ public sealed partial class HardwareSpdifInputPage : SettingsModule, ISettingsPa
     private void OnVmPropertyChanged(object? sender, PropertyChangedEventArgs e)
     {
         // SpdifRxPin can change externally on preset load / reconnect.
-        // Bulk-params parse raises this in MainViewModel; we refresh
-        // the combo so the UI stays in sync with the device.
-        if (e.PropertyName == nameof(MainViewModel.SpdifRxPin))
+        // LgSoundSyncEnabled / LgSoundSyncSupported track the same path —
+        // preset load may flip the enable bit, and a reconnect to older
+        // firmware drops the supported flag. Refresh on any of them.
+        if (e.PropertyName == nameof(MainViewModel.SpdifRxPin)
+            || e.PropertyName == nameof(MainViewModel.LgSoundSyncEnabled)
+            || e.PropertyName == nameof(MainViewModel.LgSoundSyncSupported))
+        {
             DispatcherQueue.TryEnqueue(Refresh);
+        }
     }
 
     protected override void Refresh()
@@ -82,6 +91,32 @@ public sealed partial class HardwareSpdifInputPage : SettingsModule, ISettingsPa
         // RefreshConflicts — it rebuilds with only usable pins, then
         // selects the device's current RX pin by Tag.
         RefreshConflicts();
+        RefreshLgSoundSync();
+    }
+
+    private void RefreshLgSoundSync()
+    {
+        if (Vm == null) return;
+        // Hide the entire card on firmware that doesn't expose the feature
+        // (pre-V8 STALLs REQ_GET_LG_SOUND_SYNC_ENABLE so the probe drops
+        // LgSoundSyncSupported to false). Suppress the Toggled handler
+        // while we re-sync from VM state so the local update doesn't
+        // ricochet back through Vm.LgSoundSyncEnabled and trigger a
+        // redundant USB write.
+        LgSoundSyncCard.Visibility = Vm.LgSoundSyncSupported
+            ? Visibility.Visible : Visibility.Collapsed;
+        _suppress = true;
+        try { LgSoundSyncToggle.IsOn = Vm.LgSoundSyncEnabled; }
+        finally { _suppress = false; }
+    }
+
+    private void OnLgSoundSyncToggled(object sender, RoutedEventArgs e)
+    {
+        if (_suppress || Vm == null) return;
+        // Live apply — per-preset parameter, writes through immediately
+        // to RAM via REQ_SET_LG_SOUND_SYNC_ENABLE (0xE6). The VM setter
+        // dispatches the USB control transfer on a background task.
+        Vm.LgSoundSyncEnabled = LgSoundSyncToggle.IsOn;
     }
 
     /// <summary>Rebuild the RX pin combo so it lists only pins this

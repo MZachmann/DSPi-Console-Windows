@@ -30,10 +30,6 @@
     <PackageReference Include="CommunityToolkit.WinUI.Controls.Primitives" Version="8.0.240109" />
     <PackageReference Include="CommunityToolkit.WinUI.Controls.SettingsControls" Version="8.0.240109" />
     <PackageReference Include="CommunityToolkit.WinUI.Converters" Version="8.0.240109" />
-    <!-- WASAPI / IAudioEndpointVolume wrapper for host-volume sync (User Volume + USB input).
-         NAudio.Wasapi pulls only the CoreAudioApi types we need; we don't need the full
-         NAudio package's playback/recording engine. -->
-    <PackageReference Include="NAudio.Wasapi" Version="2.2.1" />
     <Manifest Include="$(ApplicationManifest)" />
   </ItemGroup>
 
