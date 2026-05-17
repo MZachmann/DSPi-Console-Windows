@@ -13,7 +13,7 @@ namespace DSPiConsole.Usb;
 /// <summary>
 /// Implements IDspiTransfer by communicating with a remote DSPiCliServer over TCP.
 /// </summary>
-public class DspRemote : IDspiTransfer
+public class DspiRemote : IDspiTransfer
 {
     private readonly string _host;
     private readonly int _port;
@@ -42,7 +42,7 @@ public class DspRemote : IDspiTransfer
     public event EventHandler? DeviceDisconnected;
     public event EventHandler? StatusPollRequested;
 
-    public DspRemote(string host = "localhost", int port = 8084)
+    public DspiRemote(string host = "localhost", int port = 8084)
     {
         _host = host;
         _port = port;

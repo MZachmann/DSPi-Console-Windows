@@ -384,10 +384,10 @@ public partial class DspDevice : ObservableObject, IDisposable
         // var remoteHost = Environment.GetEnvironmentVariable("DSPI_REMOTE_HOST");
         // if (!string.IsNullOrEmpty(remoteHost))
         // {
-        //     return new DspRemote(remoteHost);
+        //     return new DspiRemote(remoteHost);
         // }
         // return new DspiUsb();
-        return new DspRemote("localhost", 8084);
+        return new DspiRemote("localhost", 8084);
     }
 
     public DspDevice(IDspiTransfer usb)
