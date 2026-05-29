@@ -107,7 +107,6 @@ public class DspiRemote : IDspiTransfer
         {
             while (true)
             {
-                string? line;
                 lock (_lock)
                 {
                     if (_reader == null) break;

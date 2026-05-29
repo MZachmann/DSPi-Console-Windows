@@ -1,9 +1,5 @@
-using System.Linq;
 using CommunityToolkit.Mvvm.ComponentModel;
 using DSPiConsole.Core.Models;
-using LibUsbDotNet.LibUsb;
-using LibUsbDotNet.Main;
-
 namespace DSPiConsole.Usb;
 
 /// <summary>
