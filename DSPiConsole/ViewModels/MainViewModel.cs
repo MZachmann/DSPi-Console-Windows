@@ -650,8 +650,8 @@ public partial class MainViewModel : ObservableObject, IDisposable
             });
         };
 
-        // Status polling timer (60ms interval)
-        _pollTimer = new System.Timers.Timer(60);
+        // Status polling timer (60ms interval if USB or 3000ms if remote)
+        _pollTimer = new System.Timers.Timer(_device.IsDeviceUsb ? 60 : 3000);
         _pollTimer.Elapsed += (s, e) =>
         {
             if (IsDeviceConnected)

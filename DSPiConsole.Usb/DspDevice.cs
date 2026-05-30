@@ -335,6 +335,11 @@ public partial class DspDevice : ObservableObject, IDisposable
     private bool _disposed;
 
     /// <summary>
+    /// Is this a USB or Remote device?
+    /// </summary>
+    public bool IsDeviceUsb => _usb.DeviceType == "USB";
+
+    /// <summary>
     /// Number of audio channels (set after GetDeviceInfo). RP2040=7, RP2350=11.
     /// </summary>
     public int NumChannels { get; set; } = 5; // Legacy default (5 peaks)
@@ -415,13 +420,31 @@ public partial class DspDevice : ObservableObject, IDisposable
     private static IDspiTransfer CreateDefaultTransfer()
     {
         // // Check for environment variable or settings to decide between USB and Remote
-        // var remoteHost = Environment.GetEnvironmentVariable("DSPI_REMOTE_HOST");
-        // if (!string.IsNullOrEmpty(remoteHost))
-        // {
-        //     return new DspiRemote(remoteHost);
-        // }
-        // return new DspiUsb();
-        return new DspiRemote("localhost", 8084);
+        string[] cmdargs = Environment.GetCommandLineArgs();
+        string remoteHost = string.Empty;
+        int remotePort = 8084;
+        var cmdpairs = (cmdargs.Length - 1) / 2;     // command pairs
+        for (int cmd = 0; cmd < cmdpairs; cmd++)
+        {
+            var argname = cmdargs[cmd * 2 + 1];
+            var argvalue = cmdargs[cmd * 2 + 2];
+            switch (argname)
+            {
+                case "-host":
+                    remoteHost = argvalue;
+                    break;
+                case "-port":
+                    int.TryParse(argvalue, out remotePort);
+                    break;
+                default:
+                    break;
+            }
+        }
+        if (!string.IsNullOrEmpty(remoteHost))
+        {
+            return new DspiRemote(remoteHost, remotePort);
+        }
+        return new DspiUsb();
     }
 
     public DspDevice(IDspiTransfer usb)
@@ -472,7 +495,8 @@ public partial class DspDevice : ObservableObject, IDisposable
     /// </summary>
     private void PollStatus()
     {
-        if (_disposed || !IsConnected) return;
+        if (_disposed || !IsConnected) 
+            return;
 
         try
         {

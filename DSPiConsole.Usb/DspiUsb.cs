@@ -45,6 +45,7 @@ public class DspiUsb : IDspiTransfer
     private volatile bool _notifyStop;
     private const int NotifyPacketSize = 64;
 
+    public string DeviceType => "USB";
     public bool IsConnected => _device != null;
     public string? OpenDeviceSerial => _openDeviceSerial;
     public IReadOnlyList<DSPiDeviceInfo> AvailableDevices => _availableDevices;

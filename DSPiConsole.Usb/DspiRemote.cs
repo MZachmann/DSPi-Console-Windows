@@ -31,6 +31,7 @@ public class DspiRemote : IDspiTransfer
     private readonly System.Timers.Timer _scanTimer;
     private readonly System.Timers.Timer _statusPollTimer;
 
+    public string DeviceType => "Remote";
     public bool IsConnected => _isConnected;
     public string? OpenDeviceSerial => _openDeviceSerial;
     public IReadOnlyList<DSPiDeviceInfo> AvailableDevices => _availableDevices;
@@ -47,11 +48,11 @@ public class DspiRemote : IDspiTransfer
         _host = host;
         _port = port;
 
-        _scanTimer = new System.Timers.Timer(1000);
+        _scanTimer = new System.Timers.Timer(10000);
         _scanTimer.Elapsed += (_, _) => ScanDevices();
         _scanTimer.AutoReset = true;
 
-        _statusPollTimer = new System.Timers.Timer(100);
+        _statusPollTimer = new System.Timers.Timer(2000);
         _statusPollTimer.Elapsed += (_, _) => StatusPollRequested?.Invoke(this, EventArgs.Empty);
         _statusPollTimer.AutoReset = true;
     }
@@ -212,13 +213,21 @@ public class DspiRemote : IDspiTransfer
             string resp = SendCommand("get_peaks");
             if (!resp.StartsWith("Error") && resp != "Not connected")
             {
-                try { return Convert.FromHexString(resp); } catch { }
+                try
+                {
+                    return Convert.FromHexString(resp);
+                }
+                catch(Exception ex)
+                {
+                    System.Diagnostics.Debug.WriteLine($"ScanDevices error: {ex.Message}");
+                }
             }
         }
 
         string cmd = $"cti {request} {value} {length}";
         string response = SendCommand(cmd);
-        if (response.StartsWith("Error") || response == "Not connected") return null;
+        if (response.StartsWith("Error") || response == "Not connected") 
+            return null;
         try
         {
             return Convert.FromHexString(response);

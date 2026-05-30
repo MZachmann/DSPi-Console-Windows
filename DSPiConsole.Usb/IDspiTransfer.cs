@@ -9,6 +9,7 @@ namespace DSPiConsole.Usb;
 /// </summary>
 public interface IDspiTransfer : IDisposable
 {
+    string DeviceType { get; }
     bool IsConnected { get; }
     string? OpenDeviceSerial { get; }
     IReadOnlyList<DSPiDeviceInfo> AvailableDevices { get; }
