@@ -78,12 +78,21 @@ public sealed partial class SettingsShell : UserControl
         _initialSelectionDone = true;
         try
         {
-            var first = SettingsRegistry.Pages.FirstOrDefault(p =>
-                p.Category != SettingsCategory.About && p.IsAvailable(_vm));
-            if (first != null)
+            // Default landing page is Hardware › Output Assignment — it's the
+            // most-frequently-edited surface (per-output S/PDIF vs I²S +
+            // GPIO mapping) and matches what users open Settings to do most
+            // of the time. Fall back to the first registry-ordered available
+            // page if the output-assignment page isn't registered or isn't
+            // available (e.g. a future build that gates it on platform).
+            const string DefaultPageId = "hardware.output-assignment";
+            var landing = SettingsRegistry.Pages.FirstOrDefault(p =>
+                              p.Id == DefaultPageId && p.IsAvailable(_vm))
+                          ?? SettingsRegistry.Pages.FirstOrDefault(p =>
+                              p.Category != SettingsCategory.About && p.IsAvailable(_vm));
+            if (landing != null)
             {
-                var firstItem = FindMenuItem(first.Id);
-                if (firstItem != null) Nav.SelectedItem = firstItem;
+                var item = FindMenuItem(landing.Id);
+                if (item != null) Nav.SelectedItem = item;
             }
         }
         catch (Exception ex)
@@ -119,7 +128,13 @@ public sealed partial class SettingsShell : UserControl
                 Content = MakeNavContent(title, isCategory: true, out var catDot),
                 Icon = new FontIcon { Glyph = glyph },
                 SelectsOnInvoked = false,
-                IsExpanded = false,
+                // Hardware starts expanded — it's the category that holds
+                // the default landing page (Output Assignment, see
+                // OnShellLoaded) and the most-visited group overall, so
+                // collapsing it just makes the user click it open on every
+                // Settings open. Other categories stay collapsed so the
+                // nav tree doesn't fill the sidebar by default.
+                IsExpanded = cat == SettingsCategory.Hardware,
             };
             _categoryDots[cat] = catDot;
 

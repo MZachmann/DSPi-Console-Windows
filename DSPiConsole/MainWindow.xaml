@@ -282,7 +282,12 @@
 
                     <Grid x:Name="PresetSection" Visibility="Collapsed">
                         <Grid.ColumnDefinitions>
-                            <ColumnDefinition Width="Auto" />
+                            <!-- Fixed label column matches SourceSection so the
+                                 Preset / Source dropdowns line up vertically
+                                 even though the words render to slightly
+                                 different widths. 44px fits "Preset" at
+                                 FontSize=12 with a little headroom. -->
+                            <ColumnDefinition Width="44" />
                             <ColumnDefinition Width="Auto" />
                             <ColumnDefinition Width="*" />
                         </Grid.ColumnDefinitions>
@@ -310,7 +315,9 @@
 
                     <Grid x:Name="SourceSection" Visibility="Collapsed">
                         <Grid.ColumnDefinitions>
-                            <ColumnDefinition Width="Auto" />
+                            <!-- Same fixed width as PresetSection so the two
+                                 dropdowns share a left edge. -->
+                            <ColumnDefinition Width="44" />
                             <ColumnDefinition Width="*" />
                         </Grid.ColumnDefinitions>
                         <TextBlock Text="Source" FontSize="12" VerticalAlignment="Center"

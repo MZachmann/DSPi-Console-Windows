@@ -479,6 +479,11 @@ public class DspiUsb : IDspiTransfer
     public void Dispose()
     {
         Close();
+        _pollTimer.Stop();
+        _pollTimer.Dispose();
+        _statusPollTimer.Stop();
+        _statusPollTimer.Dispose();
+        Disconnect();
         _context.Dispose();
     }
 }

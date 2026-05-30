@@ -41,7 +41,7 @@
         </controls:SettingsCard>
 
         <controls:SettingsCard Header="GPIO Pin"
-                                Description="Pin connected to external device's mute input (PCM5102A XSMT, WM8741 MUTEB, AK4493 SMUTE).">
+                                Description="Connected to external device's mute input (XSMT on PCM5102A).">
             <ComboBox x:Name="PinCombo" MinWidth="180"
                       SelectionChanged="OnConfigChanged"/>
         </controls:SettingsCard>

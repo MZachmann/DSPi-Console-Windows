@@ -419,30 +419,37 @@ public partial class DspDevice : ObservableObject, IDisposable
 
     private static IDspiTransfer CreateDefaultTransfer()
     {
-        // // Check for environment variable or settings to decide between USB and Remote
+        // Check for arguments to the command to decide between USB and Remote
+        // So sample arguments would be
+        //        DSPiConsole -r <host> [-p <port>] for remote support
+        // if there is no -r argument then assumed USB
         string[] cmdargs = Environment.GetCommandLineArgs();
         string remoteHost = string.Empty;
-        int remotePort = 8084;
-        var cmdpairs = (cmdargs.Length - 1) / 2;     // command pairs
-        for (int cmd = 0; cmd < cmdpairs; cmd++)
+        int remotePort = 0;
+        for (int cmd = 0; cmd < (cmdargs.Length-1); cmd++)
         {
-            var argname = cmdargs[cmd * 2 + 1];
-            var argvalue = cmdargs[cmd * 2 + 2];
+            var argname = cmdargs[cmd];
+            var argvalue = cmdargs[cmd + 1];
             switch (argname)
             {
-                case "-host":
+                case "-r":
                     remoteHost = argvalue;
                     break;
-                case "-port":
-                    int.TryParse(argvalue, out remotePort);
+                case "-p":
+                    if (!int.TryParse(argvalue, out remotePort))
+                        remotePort = 0;
                     break;
                 default:
                     break;
             }
         }
+        // pick either or
         if (!string.IsNullOrEmpty(remoteHost))
         {
-            return new DspiRemote(remoteHost, remotePort);
+            if (remotePort > 0)
+                return new DspiRemote(remoteHost, remotePort);
+            else // use default port
+                return new DspiRemote(remoteHost);
         }
         return new DspiUsb();
     }
@@ -1547,13 +1554,18 @@ public partial class DspDevice : ObservableObject, IDisposable
 
     /// <summary>
     /// Fetch all DSP parameters in a single bulk transfer (firmware v2+).
-    /// Wire-format V7 (firmware April 2026) is 2912 bytes — older firmware
-    /// returns fewer bytes and the parser keys off the actual transfer length.
+    /// Wire-format V10 is 2960 bytes (V7 2912 + LG Sound Sync + user volume
+    /// + DAC HW mute, 16 bytes each). Older firmware returns fewer bytes and
+    /// <see cref="BulkParamsParser"/> keys feature presence off the actual
+    /// transfer length so this stays correct against any version &gt;= V2.
+    /// Bump this only when a new wire-format section is added on the firmware
+    /// side — the parser already handles a shorter response gracefully, so
+    /// future versions need a length bump here to deliver the new bytes.
     /// Returns the response, or null if the transfer failed.
     /// </summary>
     public byte[]? GetAllParams()
     {
-        return ControlTransferIn(VendorCommands.GetAllParams, 0, 2912);
+        return ControlTransferIn(VendorCommands.GetAllParams, 0, BulkParamsParser.PacketSizeV10);
     }
 
     #region Input Source (V7+)

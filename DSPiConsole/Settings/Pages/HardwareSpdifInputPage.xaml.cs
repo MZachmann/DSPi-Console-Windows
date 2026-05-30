@@ -22,10 +22,17 @@ public sealed partial class HardwareSpdifInputPage : SettingsModule, ISettingsPa
     public HardwareSpdifInputPage()
     {
         InitializeComponent();
-        // Combo items are added by RefreshConflicts — filter on
-        // populate (only show usable pins; pins claimed elsewhere
-        // are omitted, not greyed out). Initial empty state is fine
-        // because Refresh() runs before the page is shown.
+
+        // RX can use any audio-capable GPIO; populate once at
+        // construction with every ValidPins entry. RefreshConflicts
+        // only toggles IsEnabled and updates each item's Content
+        // label — it MUST NOT clear/rebuild the Items collection,
+        // because doing so races the popup-dismissal of a user
+        // selection and triggers "Element not found" (E_FAIL) in
+        // WinUI's ComboBox layout on the next tick. Same fix as the
+        // BCK combo on the I²S page.
+        foreach (var pin in HardwarePins.ValidPins)
+            SpdifRxPinCombo.Items.Add(new ComboBoxItem { Content = $"GPIO {pin}", Tag = pin });
 
         // Subscriptions in Loaded/Unloaded so they survive sidebar
         // navigation cycles (see HardwareOutputAssignmentPage for why).
@@ -87,9 +94,9 @@ public sealed partial class HardwareSpdifInputPage : SettingsModule, ISettingsPa
     protected override void Refresh()
     {
         if (Vm == null) return;
-        // Combo contents + selection are both handled by
-        // RefreshConflicts — it rebuilds with only usable pins, then
-        // selects the device's current RX pin by Tag.
+        // Per-item enablement + selection are handled by
+        // RefreshConflicts; the combo's Items are populated once in
+        // the constructor and never modified here.
         RefreshConflicts();
         RefreshLgSoundSync();
     }
@@ -119,10 +126,15 @@ public sealed partial class HardwareSpdifInputPage : SettingsModule, ISettingsPa
         Vm.LgSoundSyncEnabled = LgSoundSyncToggle.IsOn;
     }
 
-    /// <summary>Rebuild the RX pin combo so it lists only pins this
-    /// picker can actually use — the current RX pin (always selectable
-    /// so the user can re-confirm) plus any audio-capable GPIO not
-    /// claimed by another feature.</summary>
+    /// <summary>Refresh per-item state on the RX pin combo so pins
+    /// claimed by other features appear disabled and labelled with
+    /// their owner ("GPIO 6 (OUT 1/2)"), while still-selectable pins
+    /// read as plain "GPIO N". The Items collection itself is never
+    /// modified here — that's a hard requirement because WinUI's
+    /// ComboBox throws "Element not found" (E_FAIL) when its Items
+    /// are cleared/rebuilt on a dispatcher tick that races the
+    /// popup-dismissal of a user selection. Items are populated once
+    /// in the constructor.</summary>
     private void RefreshConflicts()
     {
         if (Vm == null) return;
@@ -133,11 +145,20 @@ public sealed partial class HardwareSpdifInputPage : SettingsModule, ISettingsPa
         _suppress = true;
         try
         {
-            SpdifRxPinCombo.Items.Clear();
-            foreach (var pin in HardwarePins.ValidPins)
+            for (int i = 0; i < SpdifRxPinCombo.Items.Count; i++)
             {
-                if (pin == currentPin || !owners.ContainsKey(pin))
-                    SpdifRxPinCombo.Items.Add(new ComboBoxItem { Content = $"GPIO {pin}", Tag = pin });
+                if (SpdifRxPinCombo.Items[i] is not ComboBoxItem item) continue;
+                if (item.Tag is not byte pin) continue;
+
+                bool isCurrent = pin == currentPin;
+                string? ownerLabel = null;
+                if (!isCurrent && owners.TryGetValue(pin, out var owner))
+                    ownerLabel = owner;
+
+                item.Content = ownerLabel != null
+                    ? $"GPIO {pin} ({ownerLabel})"
+                    : $"GPIO {pin}";
+                item.IsEnabled = ownerLabel == null;
             }
             SelectPinInCombo(SpdifRxPinCombo, currentPin);
         }
@@ -171,15 +192,20 @@ public sealed partial class HardwareSpdifInputPage : SettingsModule, ISettingsPa
         var status = await Task.Run(() => Vm.SetSpdifRxPin(newPin));
         if (status == PinConfigResult.Success)
         {
+            // The PropertyChanged(SpdifRxPin) queued from
+            // Vm.SetSpdifRxPin already triggers Refresh→RefreshConflicts
+            // on this page's dispatcher; RaisePinAssignmentsChanged
+            // notifies the other Hardware pages. Items collection
+            // isn't touched (only IsEnabled/Content), so the queued
+            // path is safe.
             HardwarePins.RaisePinAssignmentsChanged();
-            RefreshConflicts();
             ShowStatus($"S/PDIF RX pin set to GPIO {newPin}", false);
             return;
         }
 
-        // Revert combo to device's actual value on failure. Combo
-        // contents are filter-on-populate so we can't index by
-        // ValidPins — match by Tag instead.
+        // Revert combo to device's actual value on failure. Items
+        // are populated in pin order, so we still match by Tag in
+        // case the combo's contents ever diverge from ValidPins.
         _suppress = true;
         SelectPinInCombo(SpdifRxPinCombo, Vm.SpdifRxPin);
         _suppress = false;

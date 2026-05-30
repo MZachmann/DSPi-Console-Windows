@@ -161,6 +161,19 @@ public sealed partial class MainWindow : Window
             if (_selectedChannel != null && !_isScrollAdjusting && !_isUpdatingGain && !_isUpdatingDelay)
                 ShowChannelEditor(_selectedChannel);
         };
+        // Bulk refreshes (preset load, factory reset, BULK_INVALIDATED) fire
+        // FiltersChanged too, so the 50ms ScheduleDashboardRefresh debounce
+        // would otherwise hold the dashboard back ~50ms while the BodePlot
+        // animation is already racing ahead. The debounce exists to coalesce
+        // EQ-drag thrashing — preset loads are single, intentional events,
+        // so cancel the pending debounce and rebuild the dashboard
+        // immediately on this dispatcher tick.
+        ViewModel.BulkRefreshed += (_, _) =>
+        {
+            _dashboardDebounce?.Stop();
+            if (DashboardPanel.Visibility == Visibility.Visible)
+                InitializeDashboard();
+        };
         ViewModel.BypassChanged += (_, _) => BodePlot.Invalidate();
         AppSettings.Instance.SettingsChanged += (_, _) =>
         {
@@ -1853,8 +1866,10 @@ public sealed partial class MainWindow : Window
                 Opacity = p.Type == FilterType.Flat ? 0.35 : 1.0,
                 VerticalAlignment = VerticalAlignment.Center
             };
-            ToolTipService.SetToolTip(bypassButton,
-                p.Bypass ? "Re-enable this band" : "Bypass this band");
+            // No tooltip — the filled-vs-hollow dot is self-explanatory once
+            // the user has clicked one, and WinUI 3's default tooltip timing
+            // pops the label whenever the cursor brushes one of the twelve
+            // per-band toggles, which reads as noise.
             bypassButton.Click += OnFilterBypassToggled;
             Grid.SetColumn(bypassButton, col);
             grid.Children.Add(bypassButton);
@@ -2853,11 +2868,16 @@ public sealed partial class MainWindow : Window
                 bool newBypass = !filters[bandIndex].Bypass;
                 _ = ViewModel.SetBandBypass((int)channel.Id, bandIndex, newBypass);
 
-                // Refresh the row so the dot fills/empties and labels dim
-                if (_selectedChannel != null)
-                {
-                    ShowChannelEditor(_selectedChannel);
-                }
+                // No synchronous ShowChannelEditor here. SetBandBypass updates
+                // the local _channelData cache before awaiting the USB transfer,
+                // then fires FiltersChanged when the transfer completes — that
+                // handler already rebuilds the editor (with the dot filled/
+                // emptied and labels dimmed) on the next dispatcher tick.
+                // Calling ShowChannelEditor here too produced two back-to-back
+                // full editor rebuilds (~60-100ms each, including a
+                // BodePlot.Redraw(gridChanged: true) that clears and rebuilds
+                // every channel's polyline) — a ~150ms UI freeze per click,
+                // which is what was reading as "blocking".
             }
         }
     }
