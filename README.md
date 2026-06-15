@@ -1,8 +1,42 @@
-# DSPi Console for Windows
+# DSPi Console for Windows -- Remote Fork
+
+This fork of the Weeb labs DSPi project Windows Console allows the <span style="color: #2ECC71;">**console to attach to a remote DSPi**</span>
+using the multi-platform tiny DSPiCliServer application. You can control a remote DSPi Pico anywhere (Windows, Mac, Linux) using the Windows gui.
+
+The common usage is to have a slow & tiny Linux CPU or old Mac or Windows machine remotely connected to the DSPi Pico. Then run DSPiCliServer on the CPU. 
+Then you can connect to it from your Windows PC using the DSPiConsole application. 
+And, of course, once DSPiCliServer is running you can use a web browser (such as on your phone) to control the DSPi volume, loudness, preset,...
+
+## Usage
+If a -r argument is provided, the console will attempt to connect to the specified remote DSPiCliRemote instance
+and use it as the DSPi Pico. If no -r argument is provided, the console will behave as a local DSPiConsole application.
+
+To use the console remotely, first ensure that DSPiCliServer is running on the remote device. Go to the [DSPiCliRemote](https://github.com/MZachmann/DSPiCliRemote) 
+repository and get the latest release then follow the installation instructions. I usually run it by just running a
+console (terminal) and running it manually. For more permanent installations I set DSPiCliServer to run at system startup.
+
+Once DSPiCliServer is running, swap to your Windows PC. From there 
+you can start the DSPiConsole application with the -r argument to connect to the remote instance.
+
+Run this like the usual Windows DSPiConsole application but with 1 or 2 optional arguments:
+
+` DSPiConsole [-r myremoteip] [-p myremoteport]`
+
+Examples :
+
+```
+DSPiConsole -r pizero.local # connect to the DSPi at pizero.local (port 8082)
+DSPiConsole # connect to the DSPi on USB
+DSPiConsole -r pizero.local -p 8086 # connect the DSPi at pizero.local using CLI port 8086
+```
+
+## ====================================================================
+
+### DSPi Console for Windows
 
 A WinUI 3 control application for the DSPi audio processor. Supports both RP2040 and RP2350 platforms.
 
-![Screenshot](Images/screenshot.png)
+ScreenShot... (elided)
 
 ## Features
 
