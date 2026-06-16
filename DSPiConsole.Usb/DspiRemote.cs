@@ -30,7 +30,7 @@ public class DspiRemote : IDspiTransfer
     public IReadOnlyList<DSPiDeviceInfo> AvailableDevices => _availableDevices;
     public DSPiDeviceInfo? SelectedDeviceInfo => _selectedDeviceInfo;
 
-    public event EventHandler<byte[]>? NotifyPacketReceived;
+    public event EventHandler<NotifyPacket>? NotifyPacketReceived;
     public event EventHandler? AvailableDevicesChanged;
     public event EventHandler? DeviceConnected;
     public event EventHandler? DeviceDisconnected;

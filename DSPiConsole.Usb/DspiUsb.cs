@@ -51,7 +51,7 @@ public class DspiUsb : IDspiTransfer
     public IReadOnlyList<DSPiDeviceInfo> AvailableDevices => _availableDevices;
     public DSPiDeviceInfo? SelectedDeviceInfo => _selectedDeviceInfo;
 
-    public event EventHandler<byte[]>? NotifyPacketReceived;
+    public event EventHandler<NotifyPacket>? NotifyPacketReceived;
     public event EventHandler? AvailableDevicesChanged;
     public event EventHandler? DeviceConnected;
     public event EventHandler? DeviceDisconnected;
@@ -439,10 +439,17 @@ public class DspiUsb : IDspiTransfer
             try { thread.Join(500); } catch { }
         }
     }
+    
+    private bool IsIdle(int len)
+    {
+        return len < 4;
+    }
 
     private void NotifyReadLoop()
     {
         var buf = new byte[NotifyPacketSize];
+        int idleCount = 0;
+        var idleTime = DateTime.Now;
         while (!_notifyStop)
         {
             UsbEndpointReader? reader = _notifyReader;
@@ -468,9 +475,53 @@ public class DspiUsb : IDspiTransfer
             if (err != LibUsbDotNet.Error.Success || len <= 0)
                 continue;
 
-            var copy = new byte[len];
-            Buffer.BlockCopy(buf, 0, copy, 0, len);
-            NotifyPacketReceived?.Invoke(this, copy);
+            // this loop uses a huge amount of resources (like 70% of Linux)
+            // because it keeps reading the idle data
+            // so if we're only getting idles just slow down
+            if (!IsIdle(len))
+            {
+                idleCount = 0;
+            }
+            else
+            {
+                if (idleCount++ == 0)
+                {
+                    // mark the first idle
+                    idleTime = DateTime.Now; 
+                }
+                else if((DateTime.Now - idleTime).TotalMilliseconds < 1000)
+                {
+                    // if we're idling, until one second passes slow down the usb i/o
+                    Thread.Sleep(100);
+                    continue;
+                }
+                else
+                {
+                    // it has been a second of constant idling, so
+                    // proceed with the idle check loop
+                    // but also notify the endpoint
+                    idleCount = 1;
+                    idleTime = DateTime.Now;    // make when we read idle
+                }
+            }
+
+            // Fire the raw-packet event before decoding so the Bulk Endpoint
+            // Monitor sees IDLE keep-alives, unknown event IDs, and malformed
+            // packets too — not just the subset ProcessNotifyPacket understands.
+            // Copy the slice we care about; the next read overwrites buf.
+            var rawListeners = NotifyPacketReceived;
+            if (rawListeners != null)
+            {
+                var copy = new byte[len];
+                Buffer.BlockCopy(buf, 0, copy, 0, len);
+                try { rawListeners(this, new NotifyPacket { Data = copy, Timestamp = DateTime.Now }); }
+                catch { /* a misbehaving subscriber must not break the reader */ }
+            }
+
+            // the ProcessNotifyPacket call is added to NotifyPacketReceived at start when the DspiUsb instance is created
+            // try { ProcessNotifyPacket(buf, len); }
+            // catch { /* a malformed packet is not fatal */ }
+
         }
     }
 

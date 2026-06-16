@@ -500,7 +500,8 @@ public partial class DspDevice : ObservableObject, IDisposable
     public DspDevice(IDspiTransfer usb)
     {
         _usb = usb;
-        _usb.NotifyPacketReceived += (s, data) => ProcessNotifyPacket(data, data.Length);
+        // we associate ProcessNotifyPacket here since it's being called by the _usb device
+        _usb.NotifyPacketReceived += (s, data) => ProcessNotifyPacket(data.Data, data.Data.Length);
         _usb.AvailableDevicesChanged += (s, e) => {
             OnPropertyChanged(nameof(AvailableDevicesList));
             AvailableDevicesChanged?.Invoke(this, EventArgs.Empty);
