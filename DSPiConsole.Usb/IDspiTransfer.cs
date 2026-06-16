@@ -15,7 +15,7 @@ public interface IDspiTransfer : IDisposable
     IReadOnlyList<DSPiDeviceInfo> AvailableDevices { get; }
     DSPiDeviceInfo? SelectedDeviceInfo { get; }
 
-    event EventHandler<NotifyPacket>? NotifyPacketReceived;
+    public event EventHandler<NotifyPacket>? NotifyPacketReceived;
     event EventHandler? AvailableDevicesChanged;
     event EventHandler? DeviceConnected;
     event EventHandler? DeviceDisconnected;

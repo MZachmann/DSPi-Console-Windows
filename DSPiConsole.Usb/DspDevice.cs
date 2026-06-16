@@ -360,6 +360,7 @@ public partial class DspDevice : ObservableObject, IDisposable
     /// Is this a USB or Remote device?
     /// </summary>
     public bool IsDeviceUsb => _usb.DeviceType == "USB";
+    public IDspiTransfer Dsp => _usb;  // just so we can get at the notifier
 
     /// <summary>
     /// Number of audio channels (set after GetDeviceInfo). RP2040=7, RP2350=11.
@@ -429,7 +430,8 @@ public partial class DspDevice : ObservableObject, IDisposable
     /// IDLE keep-alives, decoded events, unknown event IDs, malformed packets.
     /// Diagnostic hook used by the Bulk Endpoint Monitor window. Fires on the
     /// notify background thread; subscribers must marshal to the UI thread.</summary>
-    public event EventHandler<NotifyPacket>? NotifyPacketReceived;
+    /// -- now in the IDSPiTransfer subdevice
+    // public event EventHandler<NotifyPacket>? NotifyPacketReceived;
 
     private const int ChannelNamesWireOffset = 2480; // offsetof(WireBulkParams, channel_names)
     private const int WireChannelNameLen = 32;

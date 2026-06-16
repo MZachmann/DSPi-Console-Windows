@@ -68,10 +68,10 @@ public sealed partial class BulkMonitorWindow : Window
         UpdateStatusBar();
 
         // Subscribe to raw packets. Fires on the notify thread; we marshal to UI.
-        _device.NotifyPacketReceived += OnPacketReceived;
+        _device.Dsp.NotifyPacketReceived += OnPacketReceived;
         Closed += (_, _) =>
         {
-            _device.NotifyPacketReceived -= OnPacketReceived;
+            _device.Dsp.NotifyPacketReceived -= OnPacketReceived;
         };
     }
 
