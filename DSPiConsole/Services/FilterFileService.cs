@@ -12,9 +12,14 @@ namespace DSPiConsole.Services;
 public static class FilterFileService
 {
     /// <summary>
-    /// Generates export string in DSPi Console format.
+    /// Generates export string in DSPi Console format. When <paramref name="xoverData"/>
+    /// is supplied, each output channel's crossover bands (wire bands 20-23) are
+    /// written as <c>Crossover N:</c> lines after its PEQ filters. These lines use a
+    /// distinct prefix so older parsers (and the REW reader) skip them harmlessly.
     /// </summary>
-    public static string GenerateExportString(IReadOnlyDictionary<int, IReadOnlyList<FilterParams>> channelData)
+    public static string GenerateExportString(
+        IReadOnlyDictionary<int, IReadOnlyList<FilterParams>> channelData,
+        IReadOnlyDictionary<int, IReadOnlyList<FilterParams>>? xoverData = null)
     {
         var sb = new StringBuilder();
         sb.AppendLine("# DSPi Console Filter Settings");
@@ -23,16 +28,30 @@ public static class FilterFileService
 
         foreach (var channel in Channel.All)
         {
-            if (!channelData.TryGetValue((int)channel.Id, out var filters))
-                continue;
-            if (!filters.Any(f => f.Type != FilterType.Flat))
+            channelData.TryGetValue((int)channel.Id, out var filters);
+            bool hasPeq = filters != null && filters.Any(f => f.Type != FilterType.Flat);
+
+            IReadOnlyList<FilterParams>? xover = null;
+            xoverData?.TryGetValue((int)channel.Id, out xover);
+            bool hasXover = xover != null && xover.Any(f => f.Type.IsCrossover());
+
+            if (!hasPeq && !hasXover)
                 continue;
 
             sb.AppendLine($"[{channel.Name}]");
-            for (int i = 0; i < filters.Count; i++)
+
+            if (filters != null)
             {
-                sb.AppendLine(FormatFilter(i + 1, filters[i]));
+                for (int i = 0; i < filters.Count; i++)
+                    sb.AppendLine(FormatFilter(i + 1, filters[i]));
             }
+
+            if (hasXover)
+            {
+                for (int i = 0; i < xover!.Count; i++)
+                    sb.AppendLine(FormatXoverFilter(i + 1, xover[i]));
+            }
+
             sb.AppendLine();
         }
 
@@ -75,6 +94,23 @@ public static class FilterFileService
         return line;
     }
 
+    private static string FormatXoverFilter(int index, FilterParams filter)
+    {
+        var inv = CultureInfo.InvariantCulture;
+        if (!CrossoverFilter.TryGetMeta(filter.Type, out var meta))
+        {
+            return string.Format(inv, "Crossover {0,2}: OFF", index);
+        }
+
+        return string.Format(inv,
+            "Crossover {0,2}: ON  {1,-6} {2}  Fc {3,7:F1} Hz  Slope {4,3} dB/oct",
+            index,
+            CrossoverFilter.FamilyShortName(meta.Family),
+            meta.IsHighPass ? "HP" : "LP",
+            filter.Frequency,
+            meta.SlopeDbPerOct);
+    }
+
     /// <summary>
     /// Parses a filter file and returns the detected format and parsed data.
     /// </summary>
@@ -82,13 +118,14 @@ public static class FilterFileService
     {
         if (contents.TrimStart().StartsWith("# DSPi Console"))
         {
-            var channelFilters = ParseDSPiFormat(contents);
-            if (channelFilters != null && channelFilters.Count > 0)
+            var parsed = ParseDSPiFormat(contents);
+            if (parsed != null && (parsed.Value.Peq.Count > 0 || parsed.Value.Xover.Count > 0))
             {
                 return new ParseResult
                 {
                     Format = FilterFileFormat.DSPiConsole,
-                    ChannelFilters = channelFilters
+                    ChannelFilters = parsed.Value.Peq,
+                    ChannelXoverFilters = parsed.Value.Xover.Count > 0 ? parsed.Value.Xover : null
                 };
             }
         }
@@ -108,11 +145,14 @@ public static class FilterFileService
     }
 
     /// <summary>
-    /// Parses DSPi Console format (multi-channel).
+    /// Parses DSPi Console format (multi-channel). Returns the PEQ filters and the
+    /// crossover bands as separate per-channel dictionaries (crossover bands are
+    /// only present for output channels written by V11+ exports).
     /// </summary>
-    private static Dictionary<int, List<FilterParams>>? ParseDSPiFormat(string contents)
+    private static (Dictionary<int, List<FilterParams>> Peq, Dictionary<int, List<FilterParams>> Xover)? ParseDSPiFormat(string contents)
     {
         var result = new Dictionary<int, List<FilterParams>>();
+        var xoverResult = new Dictionary<int, List<FilterParams>>();
         int? currentChannel = null;
 
         foreach (var line in contents.Split('\n', '\r'))
@@ -124,6 +164,7 @@ public static class FilterFileService
             if (trimmed.StartsWith('[') && trimmed.EndsWith(']'))
             {
                 var channelName = trimmed[1..^1];
+                currentChannel = null;
                 foreach (var ch in Channel.All)
                 {
                     if (ch.Name.Equals(channelName, StringComparison.OrdinalIgnoreCase))
@@ -136,8 +177,24 @@ public static class FilterFileService
                 continue;
             }
 
-            // Parse filter line
             if (currentChannel == null) continue;
+
+            // Crossover band line (output channels, V11+). Checked before the PEQ
+            // branch; "Crossover" lines deliberately don't contain "Filter".
+            if (trimmed.StartsWith("Crossover", StringComparison.OrdinalIgnoreCase))
+            {
+                if (!trimmed.Contains(':')) continue;
+                var xo = ParseXoverLine(trimmed);
+                if (xo != null)
+                {
+                    if (!xoverResult.TryGetValue(currentChannel.Value, out var xbands))
+                        xoverResult[currentChannel.Value] = xbands = new List<FilterParams>();
+                    xbands.Add(xo);
+                }
+                continue;
+            }
+
+            // Parse PEQ filter line
             if (!trimmed.Contains("Filter") || !trimmed.Contains(':')) continue;
 
             var filter = ParseFilterLine(trimmed);
@@ -147,7 +204,58 @@ public static class FilterFileService
             }
         }
 
-        return result.Count > 0 ? result : null;
+        return result.Count > 0 || xoverResult.Count > 0 ? (result, xoverResult) : null;
+    }
+
+    /// <summary>
+    /// Parses a single crossover band line, e.g.
+    /// <c>Crossover  1: ON  LR     HP  Fc    80.0 Hz  Slope  24 dB/oct</c>.
+    /// Returns a Flat band for OFF lines (to keep band indices aligned), or null
+    /// if the family/slope can't be resolved to a real crossover type.
+    /// </summary>
+    private static FilterParams? ParseXoverLine(string line)
+    {
+        var upper = line.ToUpperInvariant();
+
+        // Disabled band → flat placeholder so subsequent band indices stay aligned.
+        if (upper.Contains(" OFF") || !upper.Contains(" ON "))
+        {
+            return new FilterParams(FilterType.Flat, 1000, 0.707f, 0);
+        }
+
+        // Family tag (LR / BW / Bessel)
+        XoverFamily family;
+        if (upper.Contains(" LR ")) family = XoverFamily.LinkwitzRiley;
+        else if (upper.Contains(" BW ")) family = XoverFamily.Butterworth;
+        else if (upper.Contains(" BESSEL ")) family = XoverFamily.Bessel;
+        else return null;
+
+        // Shape (HP / LP)
+        bool isHighPass;
+        if (upper.Contains(" HP ")) isHighPass = true;
+        else if (upper.Contains(" LP ")) isHighPass = false;
+        else return null;
+
+        // Frequency (Fc XXX Hz)
+        float freq = 1000f;
+        var fcMatch = Regex.Match(line, @"Fc\s+([\d.,]+)", RegexOptions.IgnoreCase);
+        if (fcMatch.Success && TryParseDecimal(fcMatch.Groups[1].Value, out var freqVal))
+        {
+            freq = freqVal;
+        }
+
+        // Slope (NN dB/oct) → filter order = slope / 6
+        int order = 4;
+        var slopeMatch = Regex.Match(line, @"Slope\s+(\d+)", RegexOptions.IgnoreCase);
+        if (slopeMatch.Success && int.TryParse(slopeMatch.Groups[1].Value, out var slope) && slope >= 6)
+        {
+            order = slope / 6;
+        }
+
+        var type = CrossoverFilter.Compose(family, isHighPass, order);
+        if (type == null || type == FilterType.Flat) return null;
+
+        return new FilterParams(type.Value, freq, 0.707f, 0);
     }
 
     /// <summary>
@@ -277,5 +385,11 @@ public class ParseResult
 {
     public FilterFileFormat Format { get; set; }
     public Dictionary<int, List<FilterParams>>? ChannelFilters { get; set; }
+
+    /// <summary>
+    /// Per-output-channel crossover bands parsed from a DSPi Console file, or null
+    /// when the file contains no crossover sections (e.g. legacy or REW exports).
+    /// </summary>
+    public Dictionary<int, List<FilterParams>>? ChannelXoverFilters { get; set; }
     public List<FilterParams>? SingleChannelFilters { get; set; }
 }

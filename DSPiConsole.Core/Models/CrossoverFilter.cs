@@ -132,6 +132,19 @@ public static class CrossoverFilter
         _ => "Off"
     };
 
+    /// <summary>
+    /// Parse a short family tag ("LR" / "BW" / "Bessel", case-insensitive) back
+    /// into a family. Returns null for unrecognised tokens. Inverse of
+    /// <see cref="FamilyShortName"/>; used by the filter file import.
+    /// </summary>
+    public static XoverFamily? ParseShortFamily(string tag) => tag.Trim().ToUpperInvariant() switch
+    {
+        "LR" => XoverFamily.LinkwitzRiley,
+        "BW" => XoverFamily.Butterworth,
+        "BESSEL" => XoverFamily.Bessel,
+        _ => null
+    };
+
     /// <summary>Slope label for an order, e.g. "24 dB/oct".</summary>
     public static string SlopeLabel(int order) => $"{order * 6} dB/oct";
 

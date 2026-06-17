@@ -4595,7 +4595,7 @@ public sealed partial class MainWindow : Window
 
             if (result.Format == FilterFileFormat.DSPiConsole && result.ChannelFilters != null)
             {
-                await ImportMultiChannelFilters(result.ChannelFilters);
+                await ImportMultiChannelFilters(result.ChannelFilters, result.ChannelXoverFilters);
             }
             else if (result.Format == FilterFileFormat.REW && result.SingleChannelFilters != null)
             {
@@ -4633,7 +4633,9 @@ public sealed partial class MainWindow : Window
         }
     }
 
-    private async Task ImportMultiChannelFilters(Dictionary<int, List<FilterParams>> channelFilters)
+    private async Task ImportMultiChannelFilters(
+        Dictionary<int, List<FilterParams>> channelFilters,
+        Dictionary<int, List<FilterParams>>? channelXover = null)
     {
         var dialog = new ChannelSelectionDialog { XamlRoot = Content.XamlRoot };
         dialog.ConfigureForMultiChannel(channelFilters.Keys, ViewModel.ActiveOutputs, ViewModel.IsOutputEnabled);
@@ -4646,7 +4648,9 @@ public sealed partial class MainWindow : Window
             {
                 if (channelFilters.TryGetValue(channelId, out var filters))
                 {
-                    if (!await ApplyFiltersToChannel(channelId, filters))
+                    List<FilterParams>? xover = null;
+                    channelXover?.TryGetValue(channelId, out xover);
+                    if (!await ApplyFiltersToChannel(channelId, filters, xover))
                     {
                         await ShowErrorDialog("Communication Failure - Unable to perform operation");
                         return;
@@ -4661,7 +4665,8 @@ public sealed partial class MainWindow : Window
         }
     }
 
-    private async Task<bool> ApplyFiltersToChannel(int channelId, List<FilterParams> filters)
+    private async Task<bool> ApplyFiltersToChannel(
+        int channelId, List<FilterParams> filters, List<FilterParams>? xover = null)
     {
         var channel = Channel.All.FirstOrDefault(c => (int)c.Id == channelId);
         if (channel == null) return false;
@@ -4682,6 +4687,21 @@ public sealed partial class MainWindow : Window
                 return false;
         }
 
+        // Crossover bands — only when the file specified them for this channel and
+        // the target is a crossover-capable output (V11+). A null xover list means
+        // the file had no crossover for this channel, so we leave it untouched.
+        if (xover != null && channel.IsOutput && ViewModel.CrossoverSupported)
+        {
+            for (int i = 0; i < CrossoverFilter.MaxXoverBands; i++)
+            {
+                var band = i < xover.Count
+                    ? xover[i].Clone()
+                    : new FilterParams(FilterType.Flat, 1000, 0.707f, 0);
+                if (!await SetXoverFilterWithRetry(channelId, i, band))
+                    return false;
+            }
+        }
+
         return true;
     }
 
@@ -4690,6 +4710,16 @@ public sealed partial class MainWindow : Window
         for (int attempt = 0; attempt < 5; attempt++)
         {
             if (await ViewModel.SetFilter(channelId, band, p))
+                return true;
+        }
+        return false;
+    }
+
+    private async Task<bool> SetXoverFilterWithRetry(int channelId, int localBand, FilterParams p)
+    {
+        for (int attempt = 0; attempt < 5; attempt++)
+        {
+            if (await ViewModel.SetXoverFilter(channelId, localBand, p))
                 return true;
         }
         return false;
@@ -4712,13 +4742,23 @@ public sealed partial class MainWindow : Window
         {
             // Build channel data dictionary
             var channelData = new Dictionary<int, IReadOnlyList<FilterParams>>();
+            var xoverData = new Dictionary<int, IReadOnlyList<FilterParams>>();
             foreach (var channel in Channel.All)
             {
                 var filters = ViewModel.GetFilters(channel);
                 channelData[(int)channel.Id] = filters.ToList();
+
+                // Crossover bands exist only on output channels, V11+ firmware.
+                if (channel.IsOutput && ViewModel.CrossoverSupported)
+                {
+                    var xover = ViewModel.GetXoverFilters(channel);
+                    if (xover.Count > 0)
+                        xoverData[(int)channel.Id] = xover.ToList();
+                }
             }
 
-            var output = FilterFileService.GenerateExportString(channelData);
+            var output = FilterFileService.GenerateExportString(
+                channelData, xoverData.Count > 0 ? xoverData : null);
             await Windows.Storage.FileIO.WriteTextAsync(file, output);
             await ShowSuccessDialog("Filters exported successfully");
         }

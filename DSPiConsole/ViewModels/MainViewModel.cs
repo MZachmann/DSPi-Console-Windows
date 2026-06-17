@@ -258,12 +258,29 @@ public partial class MainViewModel : ObservableObject, IDisposable
 
     public event EventHandler? InputSourceChanged;
 
-    public IReadOnlyList<Channel> ActiveOutputs => Platform switch
+    public IReadOnlyList<Channel> ActiveOutputs => OutputsForPlatform(Platform);
+
+    private static IReadOnlyList<Channel> OutputsForPlatform(string? platform) => platform switch
     {
         "RP2040" => Channel.Rp2040Outputs,
         "RP2350" => Channel.Outputs,
         _        => Array.Empty<Channel>()
     };
+
+    private static int ChannelCountForPlatform(string? platform) =>
+        platform == "RP2350" ? 11 : 7;
+
+    private static int OutputSlotCountForPlatform(string? platform) =>
+        platform == "RP2350" ? 4 : 2;
+
+    private static int OutputPinCountForPlatform(string? platform) =>
+        platform == "RP2350" ? 5 : 3;
+
+    private static int PdmOutputIndexForPlatform(string? platform) =>
+        platform == "RP2040" ? 4 : 8;
+
+    private static int EqWorkerEndForPlatform(string? platform) =>
+        platform == "RP2040" ? 4 : 8;
 
     public event EventHandler? ActiveOutputsChanged;
 
@@ -309,9 +326,9 @@ public partial class MainViewModel : ObservableObject, IDisposable
 
     // ── PDM / EQ-worker conflict helpers ──
 
-    public int PdmOutputIndex => Platform == "RP2040" ? 4 : 8;
+    public int PdmOutputIndex => PdmOutputIndexForPlatform(Platform);
     private int EqWorkerStart => 2;
-    private int EqWorkerEnd => Platform == "RP2040" ? 4 : 8; // exclusive
+    private int EqWorkerEnd => EqWorkerEndForPlatform(Platform); // exclusive
 
     public bool WouldConflict(int outputIndex)
     {
@@ -416,7 +433,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
     // removed.)
     public OutputSlotType GetOutputSlotType(int slot) =>
         slot >= 0 && slot < _outputSlotTypes.Length ? _outputSlotTypes[slot] : OutputSlotType.Spdif;
-    public int NumOutputSlots => Platform == "RP2350" ? 4 : 2;
+    public int NumOutputSlots => OutputSlotCountForPlatform(Platform);
     public byte I2SBckPin => _i2sBckPin;
     public bool MckEnabled => _mckEnabled;
     public byte MckPin => _mckPin;
@@ -484,10 +501,12 @@ public partial class MainViewModel : ObservableObject, IDisposable
                             var info = _device.GetDeviceInfo();
                             var newPlatform = info?.Platform ?? "";
                             // Set channel count for platform-aware status parsing
-                            _device.NumChannels = newPlatform == "RP2350" ? 11 : 7;
-                            _dispatcher.TryEnqueue(() => Platform = newPlatform);
-                            System.Threading.Thread.Sleep(100);
-                            FetchAll();
+                            _device.NumChannels = ChannelCountForPlatform(newPlatform);
+                            ApplyPlatformBeforeInitialSync(newPlatform);
+                            // Use the same platform value for the first full
+                            // sync. That keeps output-index mapping stable even
+                            // while the rest of the window is still catching up.
+                            FetchAll(newPlatform);
                             FetchPresetInfo();
                             FetchInputSource();
                             FetchBandBypassCapability();
@@ -729,6 +748,26 @@ public partial class MainViewModel : ObservableObject, IDisposable
         // Start device monitoring
         _device.StartMonitoring();
         _pollTimer.Start();
+    }
+
+    private void ApplyPlatformBeforeInitialSync(string platform)
+    {
+        var platformApplied = new TaskCompletionSource<bool>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+
+        // Platform changes intentionally clear stale output-enable state. The
+        // first FetchAll must run after that clear, otherwise a busy startup UI
+        // can process the queued clear after USB sync and erase fresh outputs.
+        if (!_dispatcher.TryEnqueue(() =>
+        {
+            try { Platform = platform; }
+            finally { platformApplied.TrySetResult(true); }
+        }))
+        {
+            return;
+        }
+
+        platformApplied.Task.GetAwaiter().GetResult();
     }
 
     [RelayCommand]
@@ -1156,10 +1195,13 @@ public partial class MainViewModel : ObservableObject, IDisposable
 
     #region USB Commands
 
-    private void FetchAll()
+    private void FetchAll(string? platformOverride = null)
     {
         try
         {
+            var syncPlatform = string.IsNullOrWhiteSpace(platformOverride) ? Platform : platformOverride;
+            var outputs = OutputsForPlatform(syncPlatform);
+
             // Try bulk fetch first (firmware v2+ with 0xA0 support)
             var bulk = _device.GetAllParams();
             if (bulk != null)
@@ -1167,7 +1209,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
                 var parsed = BulkParamsParser.Parse(bulk);
                 if (parsed != null)
                 {
-                    ApplyBulkParams(parsed);
+                    ApplyBulkParams(parsed, outputs);
                     return;
                 }
             }
@@ -1180,7 +1222,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
             // ancient firmware sees a clean "unsupported", and modern firmware
             // with a transient bulk-fetch failure still gets its state filled
             // in from the per-feature getters.
-            FetchAllLegacy();
+            FetchAllLegacy(syncPlatform, outputs);
             FetchUserVolume();
             FetchLgSoundSync();
             FetchDacHwMute();
@@ -1188,10 +1230,8 @@ public partial class MainViewModel : ObservableObject, IDisposable
         catch { }
     }
 
-    private void ApplyBulkParams(BulkParams bp)
+    private void ApplyBulkParams(BulkParams bp, IReadOnlyList<Channel> outputs)
     {
-        var outputs = ActiveOutputs;
-
         // Record the wire-format version so per-band GET (REQ_GET_EQ_PARAM)
         // uses the matching wValue band-field width (V11 widened it to 5 bits).
         _device.WireFormatVersion = bp.FormatVersion;
@@ -1428,7 +1468,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
         });
     }
 
-    private void FetchAllLegacy()
+    private void FetchAllLegacy(string platform, IReadOnlyList<Channel> outputs)
     {
         if (!FetchInputPreamps()) return;
         FetchMasterVolume();
@@ -1442,7 +1482,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
             }
         }
 
-        foreach (var channel in ActiveOutputs)
+        foreach (var channel in outputs)
         {
             FetchDelay((int)channel.Id);
             FetchChannelGain((int)channel.Id);
@@ -1453,8 +1493,8 @@ public partial class MainViewModel : ObservableObject, IDisposable
         FetchCrossfeed();
 
         // Fetch matrix mixer state
-        FetchMatrixRoutes();
-        var outputCount = ActiveOutputs.Count;
+        FetchMatrixRoutes(outputs);
+        var outputCount = outputs.Count;
         for (int o = 0; o < outputCount; o++)
         {
             FetchOutputEnable(o);
@@ -1462,12 +1502,12 @@ public partial class MainViewModel : ObservableObject, IDisposable
         }
 
         // Fetch pin assignments
-        int pinCount = Platform == "RP2350" ? 5 : 3;
+        int pinCount = OutputPinCountForPlatform(platform);
         for (int p = 0; p < pinCount; p++)
             FetchOutputPin(p);
 
         // Fetch I2S configuration
-        int slotCount = Platform == "RP2350" ? 4 : 2;
+        int slotCount = OutputSlotCountForPlatform(platform);
         for (int s = 0; s < slotCount; s++)
             FetchOutputSlotType(s);
         FetchI2SBckPin();
@@ -1782,10 +1822,16 @@ public partial class MainViewModel : ObservableObject, IDisposable
             ? f.Select(fp => fp.Clone()).ToList()
             : new List<FilterParams>();
 
+        // Crossover bands exist only on output channels.
+        var xover = channel.IsOutput && _xoverData.TryGetValue(channelId, out var x)
+            ? x.Select(fp => fp.Clone()).ToList()
+            : new List<FilterParams>();
+
         _channelClipboard = new ChannelClipboard
         {
             SourceIsOutput = channel.IsOutput,
             Filters = filters,
+            Xover = xover,
             Delay = channel.IsOutput && _channelDelays.TryGetValue(channelId, out var d) ? d : null,
             Gain = channel.IsOutput && _channelGains.TryGetValue(channelId, out var g) ? g : null,
             Mute = channel.IsOutput && _channelMutes.TryGetValue(channelId, out var m) ? m : null,
@@ -1811,6 +1857,29 @@ public partial class MainViewModel : ObservableObject, IDisposable
         FiltersChanged?.Invoke(this, EventArgs.Empty);
     }
 
+    /// <summary>
+    /// Replace all crossover bands on an output channel at once (used by channel
+    /// paste). Mirrors <see cref="SetAllFilters"/> but addresses the crossover
+    /// wire band indices (XoverBandBase + i). Output channels only.
+    /// </summary>
+    public void SetAllXoverFilters(int channelId, List<FilterParams> bands)
+    {
+        if (!_xoverData.TryGetValue(channelId, out var existing)) return;
+
+        var count = Math.Min(bands.Count, existing.Count);
+        for (int i = 0; i < count; i++)
+            existing[i] = bands[i];
+
+        var snapshot = bands.Take(count).Select(fp => fp.Clone()).ToList();
+        Task.Run(() =>
+        {
+            for (int i = 0; i < snapshot.Count; i++)
+                _device.SetFilter(channelId, CrossoverFilter.XoverBandBase + i, snapshot[i]);
+        });
+
+        FiltersChanged?.Invoke(this, EventArgs.Empty);
+    }
+
     public void PasteChannelParams(Channel target)
     {
         if (_channelClipboard == null) return;
@@ -1820,9 +1889,13 @@ public partial class MainViewModel : ObservableObject, IDisposable
         // Filters are universal — always paste (deep-cloned)
         SetAllFilters(targetId, _channelClipboard.Filters.Select(fp => fp.Clone()).ToList());
 
-        // Delay, gain, mute: only paste when both source and target are outputs
+        // Delay, gain, mute, and crossover bands are output-only — paste only
+        // when both source and target are outputs.
         if (target.IsOutput && _channelClipboard.SourceIsOutput)
         {
+            // Crossover only on V11+ firmware; skip the writes otherwise.
+            if (CrossoverSupported)
+                SetAllXoverFilters(targetId, _channelClipboard.Xover.Select(fp => fp.Clone()).ToList());
             if (_channelClipboard.Delay.HasValue)
                 SetDelay(targetId, _channelClipboard.Delay.Value);
             if (_channelClipboard.Gain.HasValue)
@@ -1891,9 +1964,9 @@ public partial class MainViewModel : ObservableObject, IDisposable
             _dispatcher.TryEnqueue(() => CrossfeedItd = itd.Value);
     }
 
-    private void FetchMatrixRoutes()
+    private void FetchMatrixRoutes(IReadOnlyList<Channel>? outputsOverride = null)
     {
-        var outputs = ActiveOutputs;
+        var outputs = outputsOverride ?? ActiveOutputs;
         for (int input = 0; input < 2; input++)
         {
             for (int o = 0; o < outputs.Count; o++)

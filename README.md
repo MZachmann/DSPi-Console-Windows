@@ -3,24 +3,25 @@
 This fork of the Weeb labs DSPi project Windows Console allows the <span style="color: #2ECC71;">**console to attach to a remote DSPi**</span>
 using the multi-platform tiny DSPiCliServer application. You can control a remote DSPi Pico anywhere (Windows, Mac, Linux) using the Windows gui.
 
-The common usage is to have a slow & tiny Linux CPU or old Mac or Windows machine remotely connected to the DSPi Pico. Then run DSPiCliServer on the CPU. 
-Then you can connect to it from your Windows PC using the DSPiConsole application. 
-And, of course, once DSPiCliServer is running you can use a web browser (such as on your phone) to control the DSPi volume, loudness, preset,...
+The common usage is to have a remote slow & tiny Linux CPU or old Mac or Windows machine connected to the DSPi Pico USB. Then run DSPiCliServer on the remote machine,  
+which lets you then 
+
+1. run a web browser (from anything on your network like a phone) and browse to the server to control the DSPi volumes, loudness, preset and other settings
+2. use this DSPiConsole application to set up and control the DSPi remotely from any Windows computer on your network
 
 ## Usage
-If a -r argument is provided, the console will attempt to connect to the specified remote DSPiCliRemote instance
-and use it as the DSPi Pico. If no -r argument is provided, the console will behave as a local DSPiConsole application.
-
-To use the console remotely, first ensure that DSPiCliServer is running on the remote device. Go to the [DSPiCliRemote](https://github.com/MZachmann/DSPiCliRemote) 
-repository and get the latest release then follow the installation instructions. I usually run it by just running a
-console (terminal) and running it manually. For more permanent installations I set DSPiCliServer to run at system startup.
-
-Once DSPiCliServer is running, swap to your Windows PC. From there 
-you can start the DSPiConsole application with the -r argument to connect to the remote instance.
-
 Run this like the usual Windows DSPiConsole application but with 1 or 2 optional arguments:
 
 ` DSPiConsole [-r myremoteip] [-p myremoteport]`
+
+If an -r argument is provided, the console will attempt to connect to the specified remote DSPiCliRemote instance
+and use it as the DSPi Pico. If no -r argument is provided, the console will connect to your USB-local DSPi (as usual).
+
+Ensure that DSPiCliServer is running on the remote device. Go to the [DSPiCliRemote](https://github.com/MZachmann/DSPiCliRemote) 
+repository and get the latest release then follow the installation instructions. I usually run it by just running a
+console (terminal) and running it manually. For more permanent installations I set DSPiCliServer to run at system startup.
+
+Once DSPiCliServer is running, you can swap to your Windows PC.
 
 Examples :
 
