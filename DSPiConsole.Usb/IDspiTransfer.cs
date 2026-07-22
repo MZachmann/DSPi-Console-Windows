@@ -1,0 +1,33 @@
+using System;
+using System.Collections.Generic;
+using CommunityToolkit.Mvvm.ComponentModel;
+using DSPiConsole.Core.Models;
+
+namespace DSPiConsole.Usb;
+
+/// <summary>
+/// Interface for USB transfer operations and device management.
+/// </summary>
+public interface IDspiTransfer : IDisposable
+{
+    string DeviceType { get; }
+    bool IsConnected { get; }
+    string? OpenDeviceSerial { get; }
+    IReadOnlyList<DSPiDeviceInfo> AvailableDevices { get; }
+    DSPiDeviceInfo? SelectedDeviceInfo { get; }
+
+    public event EventHandler<NotifyPacket>? NotifyPacketReceived;
+    event EventHandler? AvailableDevicesChanged;
+    event EventHandler? DeviceConnected;
+    event EventHandler? DeviceDisconnected;
+    event EventHandler? StatusPollRequested;
+
+    void StartMonitoring();
+    void StopMonitoring();
+    void ScanDevices();
+    void OpenDevice(DSPiDeviceInfo deviceInfo);
+    void Disconnect();
+    void Reconnect();
+    bool ControlTransferOut(byte request, ushort value = 0, byte[]? data = null);
+    byte[]? ControlTransferIn(byte request, ushort value = 0, int length = 4);
+}

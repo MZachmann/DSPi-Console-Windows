@@ -396,6 +396,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
     [ObservableProperty]
     private DSPiDeviceInfo? _selectedDeviceItem;
 
+    [ObservableProperty]
     private bool _isSwitchingDevice;
 
     /// <summary>Callback for showing unsaved changes dialog. Registered by MainWindow.</summary>
@@ -850,8 +851,8 @@ public partial class MainViewModel : ObservableObject, IDisposable
             });
         };
 
-        // Status polling timer (60ms interval)
-        _pollTimer = new System.Timers.Timer(60);
+        // Status polling timer (60ms interval if USB or 3000ms if remote)
+        _pollTimer = new System.Timers.Timer(_device.IsDeviceUsb ? 60 : 3000);
         _pollTimer.Elapsed += (s, e) =>
         {
             if (IsDeviceConnected)
@@ -924,9 +925,9 @@ public partial class MainViewModel : ObservableObject, IDisposable
                     break;
                 case UnsavedAction.Cancel:
                     // Revert selection in UI
-                    _isSwitchingDevice = true;
+                    IsSwitchingDevice = true;
                     SelectedDeviceItem = _device.SelectedDeviceInfo;
-                    _isSwitchingDevice = false;
+                    IsSwitchingDevice = false;
                     return;
             }
         }
@@ -2731,7 +2732,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
     {
         var rounded = MathF.Round(value, 1);
         Task.Run(() => _device.SetInputPreamp(0, rounded));
-        if (_masterPeqLinked && Math.Abs(InputPreampRDb - rounded) > 0.05f)
+        if (MasterPeqLinked && Math.Abs(InputPreampRDb - rounded) > 0.05f)
             InputPreampRDb = rounded;
         CheckDirty();
     }
@@ -2740,7 +2741,7 @@ public partial class MainViewModel : ObservableObject, IDisposable
     {
         var rounded = MathF.Round(value, 1);
         Task.Run(() => _device.SetInputPreamp(1, rounded));
-        if (_masterPeqLinked && Math.Abs(InputPreampLDb - rounded) > 0.05f)
+        if (MasterPeqLinked && Math.Abs(InputPreampLDb - rounded) > 0.05f)
             InputPreampLDb = rounded;
         CheckDirty();
     }
