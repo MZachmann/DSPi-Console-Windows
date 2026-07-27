@@ -91,7 +91,7 @@
                             <DropDownButton x:Name="ChannelPresets" Grid.Column="1" Content="Presets"
                                             Padding="8,2,8,2" FontSize="12"/>
                         </Grid>
-                        <TextBlock Text="Route the generated signal to one or more outputs."
+                        <TextBlock Text="Route the generated signal to one or more outputs. Right-click a selected channel to invert its polarity (shown amber)."
                                    FontSize="11" Foreground="{ThemeResource TextFillColorSecondaryBrush}"
                                    TextWrapping="Wrap"/>
                         <StackPanel x:Name="ChannelHost" Margin="0,4,0,0"/>
@@ -113,7 +113,10 @@
                             <Slider x:Name="LevelSlider" Minimum="-120" Maximum="0" StepFrequency="1"
                                     ValueChanged="OnLevelChanged"/>
                             <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="4" Margin="8,0,0,0">
-                                <TextBox x:Name="LevelBox" Width="52" TextChanged="OnLevelTextChanged"/>
+                                <!-- Committed on Enter / focus loss: applying per keystroke
+                                     would send "-3" on the way to "-30". -->
+                                <TextBox x:Name="LevelBox" Width="52"
+                                         LostFocus="OnLevelCommit" KeyDown="OnLevelKeyDown"/>
                                 <TextBlock Text="dB" VerticalAlignment="Center"
                                            Foreground="{ThemeResource TextFillColorSecondaryBrush}"/>
                             </StackPanel>

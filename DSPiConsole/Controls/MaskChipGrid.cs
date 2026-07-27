@@ -1,6 +1,8 @@
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Controls.Primitives;
+using Microsoft.UI.Xaml.Media;
+using Windows.UI;
 
 namespace DSPiConsole.Controls;
 
@@ -16,10 +18,33 @@ namespace DSPiConsole.Controls;
 /// <c>onToggle(bit, isOn)</c> callback and re-renders from an authoritative
 /// mask via <see cref="SetMask"/>, so the ViewModel stays the single source of
 /// truth.
+///
+/// A caller that passes <c>onSecondaryToggle</c> also gets a second, independent
+/// per-chip state driven by right-click (the siggen polarity-invert mask): a chip
+/// in that state fills amber instead of the accent colour. The secondary state is
+/// only meaningful on a checked chip, so right-clicking an unchecked one is ignored.
 /// </summary>
 public sealed class MaskChipGrid
 {
-    private readonly List<(ToggleButton chip, int bit)> _chips = new();
+    /// <summary>Fill for a chip whose secondary state is set. Matches the amber used
+    /// for pot controls in the Control Surfaces window.</summary>
+    private static readonly Color Amber = Color.FromArgb(255, 0xF0, 0xC4, 0x59);
+    private static readonly Color AmberPointerOver = Color.FromArgb(255, 0xFA, 0xD1, 0x72);
+    private static readonly Color AmberPressed = Color.FromArgb(255, 0xD8, 0xAE, 0x45);
+    /// <summary>Amber is a light fill, so checked text flips to near-black on it.</summary>
+    private static readonly Color AmberText = Color.FromArgb(255, 0x1B, 0x1B, 0x1B);
+
+    /// <summary>A chip plus the brushes its checked visual states resolve to. The
+    /// brush instances are installed in the chip's own Resources before the template
+    /// expands, so recolouring them in place repaints the chip live.</summary>
+    private sealed class Chip
+    {
+        public ToggleButton Button = null!;
+        public int Bit;
+        public SolidColorBrush? Fill, FillPointerOver, FillPressed, Text;
+    }
+
+    private readonly List<Chip> _chips = new();
     private readonly Action<int, bool> _onToggle;
     private bool _suppress;
 
@@ -44,9 +69,13 @@ public sealed class MaskChipGrid
     /// the right. When false, chips are a fixed compact width and left-packed.</param>
     /// <param name="captionForBit">Optional override for a chip's caption; return null
     /// to use the default 1-based number (e.g. return "S" for the sub output).</param>
+    /// <param name="onSecondaryToggle">Optional right-click handler, called with the bit
+    /// index. Enables the amber secondary state; drive it back via
+    /// <see cref="SetSecondaryMask"/>. Right-clicks on unchecked chips are swallowed.</param>
     public MaskChipGrid(IReadOnlyList<int> bitIndices, Func<int, string> tooltipForBit,
                         Action<int, bool> onToggle, bool stretch = false,
-                        Func<int, string?>? captionForBit = null)
+                        Func<int, string?>? captionForBit = null,
+                        Action<int>? onSecondaryToggle = null)
     {
         _onToggle = onToggle;
         int count = bitIndices.Count;
@@ -92,18 +121,62 @@ public sealed class MaskChipGrid
             ToolTipService.SetToolTip(chip, tooltipForBit(bit));
             chip.Checked += (_, _) => { if (!_suppress) _onToggle(bit, true); };
             chip.Unchecked += (_, _) => { if (!_suppress) _onToggle(bit, false); };
-            _chips.Add((chip, bit));
+
+            var entry = new Chip { Button = chip, Bit = bit };
+
+            if (onSecondaryToggle != null)
+            {
+                // Own the brushes the checked states resolve to, so the fill can be
+                // switched between accent and amber later by recolouring in place.
+                entry.Fill = new SolidColorBrush(AccentColor("AccentFillColorDefaultBrush"));
+                entry.FillPointerOver = new SolidColorBrush(AccentColor("AccentFillColorSecondaryBrush"));
+                entry.FillPressed = new SolidColorBrush(AccentColor("AccentFillColorTertiaryBrush"));
+                entry.Text = new SolidColorBrush(AccentColor("TextOnAccentFillColorPrimaryBrush"));
+
+                chip.Resources["ToggleButtonBackgroundChecked"] = entry.Fill;
+                chip.Resources["ToggleButtonBackgroundCheckedPointerOver"] = entry.FillPointerOver;
+                chip.Resources["ToggleButtonBackgroundCheckedPressed"] = entry.FillPressed;
+                chip.Resources["ToggleButtonForegroundChecked"] = entry.Text;
+                chip.Resources["ToggleButtonForegroundCheckedPointerOver"] = entry.Text;
+                chip.Resources["ToggleButtonForegroundCheckedPressed"] = entry.Text;
+
+                chip.RightTapped += (_, e) =>
+                {
+                    e.Handled = true;
+                    if (chip.IsChecked == true) onSecondaryToggle(bit);
+                };
+            }
+
+            _chips.Add(entry);
         }
 
         Root = (Panel?)grid ?? stack!;
     }
 
+    private static Color AccentColor(string key) =>
+        Application.Current.Resources[key] is SolidColorBrush b ? b.Color : Microsoft.UI.Colors.Transparent;
+
     /// <summary>Reflect an authoritative mask into the chip states without firing callbacks.</summary>
     public void SetMask(uint mask)
     {
         _suppress = true;
-        foreach (var (chip, bit) in _chips)
-            chip.IsChecked = (mask & (1u << bit)) != 0;
+        foreach (var c in _chips)
+            c.Button.IsChecked = (mask & (1u << c.Bit)) != 0;
         _suppress = false;
+    }
+
+    /// <summary>Reflect the secondary (amber) mask. No-op for grids built without an
+    /// <c>onSecondaryToggle</c> handler.</summary>
+    public void SetSecondaryMask(uint mask)
+    {
+        foreach (var c in _chips)
+        {
+            if (c.Fill == null) continue;
+            bool on = (mask & (1u << c.Bit)) != 0;
+            c.Fill.Color = on ? Amber : AccentColor("AccentFillColorDefaultBrush");
+            c.FillPointerOver!.Color = on ? AmberPointerOver : AccentColor("AccentFillColorSecondaryBrush");
+            c.FillPressed!.Color = on ? AmberPressed : AccentColor("AccentFillColorTertiaryBrush");
+            c.Text!.Color = on ? AmberText : AccentColor("TextOnAccentFillColorPrimaryBrush");
+        }
     }
 }

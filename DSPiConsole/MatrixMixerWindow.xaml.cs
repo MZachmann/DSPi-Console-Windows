@@ -93,12 +93,14 @@ public sealed partial class MatrixMixerWindow : Window
             if (_closed) return;
             if (e.PropertyName == nameof(MainViewModel.IsDeviceConnected))
                 DispatcherQueue.TryEnqueue(() => { if (!_closed) UpdateDisconnectOverlay(); });
-            else if (e.PropertyName == nameof(MainViewModel.ActiveInputs))
+            else if (e.PropertyName is nameof(MainViewModel.ActiveInputs)
+                                    or nameof(MainViewModel.UpmixRowsActive)
+                                    or nameof(MainViewModel.UpmixSurroundRowsActive))
                 DispatcherQueue.TryEnqueue(() =>
                 {
                     // ActiveOutputs changes also raise ActiveInputs; only rebuild
-                    // here when the input row count actually changed.
-                    if (!_closed && _viewModel.ActiveInputs.Count != _builtInputCount)
+                    // here when the source row count actually changed.
+                    if (!_closed && BuildRowList().Count != _builtInputCount)
                         RebuildUI();
                 });
         };
@@ -195,10 +197,11 @@ public sealed partial class MatrixMixerWindow : Window
             grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto, MinWidth = 95 });
         grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
 
-        // Rows: 0=headers, 1=routing bar, then one row per active input with a
-        // divider between each pair, then the output bar + enable/gain/delay/mute.
-        var inputs = _viewModel.ActiveInputs;
-        int inputCount = inputs.Count;
+        // Rows: 0=headers, 1=routing bar, then one row per matrix source (active
+        // inputs plus any upmix-derived rows) with a divider between each pair,
+        // then the output bar + enable/gain/delay/mute.
+        var sourceRows = BuildRowList();
+        int inputCount = sourceRows.Count;
         _builtInputCount = inputCount;
         int outputBarRow = 2 * inputCount + 1;
         for (int r = 0; r < outputBarRow + 5; r++)
@@ -284,10 +287,11 @@ public sealed partial class MatrixMixerWindow : Window
         // ── Row 1: ROUTING section bar ──
         AddSectionBar(grid, 1, "ROUTING", outputCount);
 
-        // ── Input rows (one per active input, dividers between) ──
+        // ── Source rows (one per active input / upmix row, dividers between) ──
         for (int i = 0; i < inputCount; i++)
         {
-            AddInputRow(grid, 2 + 2 * i, i, inputs[i], outputCount);
+            AddInputRow(grid, 2 + 2 * i, sourceRows[i].WireInput, sourceRows[i].Channel,
+                sourceRows[i].Label, outputCount);
             if (i == inputCount - 1) break;
 
             var inputDivider = new Border
@@ -578,12 +582,38 @@ public sealed partial class MatrixMixerWindow : Window
             Microsoft.UI.Dispatching.DispatcherQueuePriority.Low, ResizeToContent);
     }
 
+    // One matrix source row: wire input index (crosspoint row), a channel for the
+    // row color, and the display label. Rows 2-4 double as the upmix-derived
+    // C/Ls/Rs feeds while the upmixer runs on a stereo input (same crosspoint
+    // storage as multichannel inputs 3-5 — the label is contextual by design).
+    private readonly record struct MatrixRow(int WireInput, Channel Channel, string Label);
+
+    private List<MatrixRow> BuildRowList()
+    {
+        var rows = new List<MatrixRow>();
+        var inputs = _viewModel.ActiveInputs;
+        for (int i = 0; i < inputs.Count; i++)
+            rows.Add(new MatrixRow(i, inputs[i], _viewModel.GetChannelName(inputs[i])));
+        if (_viewModel.UpmixRowsActive)
+        {
+            // Only reachable with exactly 2 active inputs, so the grid position
+            // of each upmix row equals its wire input index.
+            rows.Add(new MatrixRow(2, Channel.Input3, "Upmix C"));
+            if (_viewModel.UpmixSurroundRowsActive)
+            {
+                rows.Add(new MatrixRow(3, Channel.Input4, "Upmix Ls"));
+                rows.Add(new MatrixRow(4, Channel.Input5, "Upmix Rs"));
+            }
+        }
+        return rows;
+    }
+
     // Adds an input row (routing section): colored label + route cells per output
-    private void AddInputRow(Grid grid, int row, int inputIndex, Channel inputCh, int outputCount)
+    private void AddInputRow(Grid grid, int row, int inputIndex, Channel inputCh, string label0, int outputCount)
     {
         var label = new TextBlock
         {
-            Text = _viewModel.GetChannelName(inputCh),
+            Text = label0,
             FontSize = 11,
             FontWeight = Microsoft.UI.Text.FontWeights.SemiBold,
             Foreground = new SolidColorBrush(inputCh.Color),
@@ -680,9 +710,9 @@ public sealed partial class MatrixMixerWindow : Window
 
     private FrameworkElement BuildRouteCell(int input, int output, Windows.UI.Color inputColor)
     {
-        // Tighten the cells when many input rows are shown so an 8-input
+        // Tighten the cells when many source rows are shown so an 8-input
         // matrix still fits on screen.
-        bool compact = _viewModel.ActiveInputs.Count > 4;
+        bool compact = _builtInputCount > 4;
         var panel = new StackPanel
         {
             HorizontalAlignment = HorizontalAlignment.Center,

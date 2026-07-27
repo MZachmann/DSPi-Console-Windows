@@ -1,0 +1,795 @@
+using System.Text.Json;
+using DSPiConsole.Core.Models;
+using DSPiConsole.Models;
+using DSPiConsole.Settings;
+using DSPiConsole.Usb;
+using DSPiConsole.ViewModels;
+
+namespace DSPiConsole.Services;
+
+/// <summary>Which parts of a document an import should apply.</summary>
+public sealed class PresetApplyOptions
+{
+    /// <summary>EQ, crossover, delays, gains, matrix, the DSP feature blocks and
+    /// channel names. Always applied — it is what a preset file is for.</summary>
+    public bool AudioProcessing { get; set; } = true;
+
+    /// <summary>Master and user volume. Off by default: a document from another
+    /// system would otherwise change how loud the room gets on import.</summary>
+    public bool VolumeLevels { get; set; }
+
+    /// <summary>GPIO pin assignments, clocking, ADAT and the S/PDIF & I2S input
+    /// wiring. Off by default — these describe a board, not a listening setup.</summary>
+    public bool HardwareIo { get; set; }
+}
+
+/// <summary>What an import actually did, so the user is told rather than
+/// left to infer it from the UI.</summary>
+public sealed class PresetApplyReport
+{
+    public int ChannelsApplied { get; set; }
+    public int BandsApplied { get; set; }
+    public int CrossoverBandsApplied { get; set; }
+    public int CrosspointsApplied { get; set; }
+
+    /// <summary>Channels in the document that this device does not have.</summary>
+    public List<string> MissingChannels { get; } = new();
+
+    /// <summary>Blocks skipped because this firmware/platform lacks the feature,
+    /// or because applying them would have conflicted.</summary>
+    public List<string> Skipped { get; } = new();
+}
+
+/// <summary>
+/// Saves and restores a complete DSP configuration as a file. The document
+/// covers what a firmware preset slot covers (see <see cref="PresetDocument"/>);
+/// it is applied through the ordinary ViewModel setters rather than a bulk
+/// write, so every value goes through the same clamping, platform gating and
+/// dirty-tracking as a user edit.
+/// </summary>
+public static class PresetFileService
+{
+    public const string FileExtension = ".dspipreset";
+
+    private static readonly JsonSerializerOptions WriteOptions = new()
+    {
+        WriteIndented = true,
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+    };
+
+    private static readonly JsonSerializerOptions ReadOptions = new()
+    {
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+        PropertyNameCaseInsensitive = true,
+    };
+
+    // ── Capture ──────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Snapshot the current configuration. Reads the ViewModel, which is the
+    /// live mirror of the device (kept current by the bulk fetch and the notify
+    /// endpoint), so this does not need the bus to be idle.
+    /// </summary>
+    public static PresetDocument Capture(MainViewModel vm, string? name = null)
+    {
+        var doc = new PresetDocument
+        {
+            Meta = new PresetDocumentMeta
+            {
+                Name = name,
+                SavedUtc = DateTimeOffset.UtcNow,
+                AppVersion = typeof(PresetFileService).Assembly.GetName().Version?.ToString(),
+                Platform = vm.Platform,
+                WireFormatVersion = vm.Device.WireFormatVersion,
+                InputChannelCount = vm.NumInputChannels,
+                OutputChannelCount = vm.NumOutputChannels,
+            },
+        };
+
+        // ── Global ──
+        var g = doc.Global;
+        for (int wireIn = 0; wireIn < g.InputPreampsDb.Length; wireIn++)
+            g.InputPreampsDb[wireIn] = vm.InputPreampAt(wireIn);
+        g.Bypass = vm.Bypass;
+        g.MasterVolumeDb = vm.MasterVolumeDb;
+        g.UserVolumeDb = vm.UserVolumeDb;
+        g.InputSource = (byte)vm.ActiveInputSource;
+        g.LgSoundSyncEnabled = vm.LgSoundSyncEnabled;
+        for (int pair = 0; pair < g.InputPairLinked.Length; pair++)
+            g.InputPairLinked[pair] = vm.GetInputPairLinked(pair);
+
+        // ── Feature blocks ──
+        doc.Loudness = new PresetLoudnessBlock
+        {
+            Enabled = vm.LoudnessEnabled,
+            RefSpl = vm.LoudnessRefSPL,
+            IntensityPct = vm.LoudnessIntensity,
+            OutputMask = vm.LoudnessOutputMask,
+        };
+
+        doc.Crossfeed = new PresetCrossfeedBlock
+        {
+            Enabled = vm.CrossfeedEnabled,
+            Preset = vm.CrossfeedPreset,
+            FreqHz = vm.CrossfeedFreq,
+            FeedDb = vm.CrossfeedFeed,
+            Itd = vm.CrossfeedItd,
+            OutputPairMask = vm.CrossfeedOutputPairMask,
+        };
+
+        doc.Leveller = new PresetLevellerBlock
+        {
+            Enabled = vm.LevellerEnabled,
+            Speed = vm.LevellerSpeed,
+            Lookahead = vm.LevellerLookahead,
+            AmountPct = vm.LevellerAmount,
+            MaxGainDb = vm.LevellerMaxGainDb,
+            GateDb = vm.LevellerGateDb,
+            DetectorMask = vm.LevellerDetectorMask,
+            ApplyMask = vm.LevellerApplyMask,
+        };
+
+        if (vm.PsybassSupported)
+        {
+            doc.Psybass = new PresetPsybassBlock
+            {
+                Enabled = vm.PsybassEnabled,
+                CutoffHz = vm.PsybassCutoffHz,
+                HarmonicsDb = vm.PsybassHarmonicsDb,
+                DriveDb = vm.PsybassDriveDb,
+                CharacterPct = vm.PsybassCharacterPct,
+                OriginalDb = vm.PsybassOriginalDb,
+                OutputMask = vm.PsybassOutputMask,
+            };
+        }
+
+        if (vm.UpmixSupported)
+        {
+            doc.Upmix = new PresetUpmixBlock
+            {
+                Enabled = vm.UpmixEnabled,
+                CenterMode = vm.UpmixCenterMode,
+                SurroundMode = vm.UpmixSurroundMode,
+                StrengthPct = vm.UpmixStrengthPct,
+                CenterWidthPct = vm.UpmixCenterWidthPct,
+                ThresholdPct = vm.UpmixThresholdPct,
+                AttackMs = vm.UpmixAttackMs,
+                ReleaseMs = vm.UpmixReleaseMs,
+                DetectorHpfHz = vm.UpmixDetectorHpfHz,
+                SurroundDelayMs = vm.UpmixSurroundDelayMs,
+                SurroundHpfHz = vm.UpmixSurroundHpfHz,
+                SurroundLpfHz = vm.UpmixSurroundLpfHz,
+                DecorrPct = vm.UpmixDecorrPct,
+                PresenceDb = vm.UpmixPresenceDb,
+            };
+        }
+
+        // ── Channels ──
+        foreach (var channel in DeviceChannels(vm))
+        {
+            int id = (int)channel.Id;
+            var block = new PresetChannelBlock
+            {
+                ChannelId = id,
+                Name = vm.GetChannelName(channel),
+                IsOutput = channel.IsOutput,
+                DelayMs = vm.GetChannelDelay(channel),
+            };
+
+            if (channel.IsOutput)
+            {
+                int outIndex = vm.GetOutputIndex(id);
+                block.GainDb = vm.GetChannelGain(channel);
+                block.Muted = outIndex >= 0 && vm.GetOutputMuted(outIndex);
+                block.Enabled = outIndex >= 0 && vm.IsOutputEnabled(outIndex);
+            }
+
+            foreach (var band in vm.GetFilters(channel))
+                block.Eq.Add(PresetBandBlock.From(band));
+
+            if (channel.IsOutput && vm.CrossoverSupported)
+            {
+                foreach (var band in vm.GetXoverFilters(channel))
+                    block.Crossover.Add(PresetBandBlock.From(band));
+            }
+
+            doc.Channels.Add(block);
+        }
+
+        // ── Matrix ──
+        int outputCount = Math.Min(vm.ActiveOutputs.Count, MainViewModel.MatrixMaxOutputs);
+        for (int inp = 0; inp < MainViewModel.MatrixMaxInputs; inp++)
+        {
+            for (int o = 0; o < outputCount; o++)
+            {
+                doc.Matrix.Add(new PresetCrosspointBlock
+                {
+                    Input = inp,
+                    Output = o,
+                    Enabled = vm.GetMatrixRouting(inp, o),
+                    Invert = vm.GetMatrixInvert(inp, o),
+                    GainDb = vm.GetMatrixGain(inp, o),
+                });
+            }
+        }
+
+        // ── Physical IO ──
+        var io = doc.Io;
+        // Indexed by pin-output id. Only the ids this board has are filled; the
+        // rest stay 0, and the import skips them the same way. Note that PDM's
+        // id is platform-dependent (2 on RP2040, 4 on RP2350), which is one
+        // more reason the IO block is opt-in on import.
+        foreach (var pinOutput in HardwarePins.AllPinOutputs(vm.Platform))
+            if (pinOutput.Id >= 0 && pinOutput.Id < io.OutputPins.Length)
+                io.OutputPins[pinOutput.Id] = vm.GetOutputPinValue(pinOutput.Id);
+        for (int s = 0; s < io.OutputSlotTypes.Length; s++)
+            io.OutputSlotTypes[s] = (byte)vm.GetOutputSlotType(s);
+
+        io.I2sBckPin = vm.I2SBckPin;
+        io.MckEnabled = vm.MckEnabled;
+        io.MckPin = vm.MckPin;
+        io.MckMultiplier = vm.MckMultiplier;
+        io.I2sClockMode = vm.I2sClockMode;
+        io.I2sClockPinMode = vm.I2sClockPinMode;
+        io.I2sBckPinSlave = vm.I2sBckPinSlave;
+
+        for (int i = 0; i < io.SpdifRxPins.Length; i++)
+            io.SpdifRxPins[i] = vm.SpdifRxPinAt(i);
+        io.SpdifEnabledExt = (byte)((vm.SpdifInputEnabled(1) ? 1 : 0) | (vm.SpdifInputEnabled(2) ? 2 : 0));
+
+        for (int pair = 0; pair < io.I2sRxPins.Length; pair++)
+            io.I2sRxPins[pair] = vm.I2sRxPinAt(pair);
+        io.I2sInputChannels = vm.I2sInputChannels;
+        io.I2sInputRateHz = vm.I2sInputRateHz;
+
+        io.AdatEnabled = vm.AdatEnabled;
+        io.AdatPin = vm.AdatPin;
+        io.AdatInputEnabled = vm.AdatInputEnabled;
+        io.AdatInputPin = vm.AdatInputPin;
+        io.AdatInputClockMode = vm.AdatInputClockMode;
+
+        if (vm.DacHwMuteSupported)
+        {
+            var d = vm.DacHwMute;
+            io.DacHwMute = new PresetDacHwMuteBlock
+            {
+                Enabled = d.Enabled,
+                ActiveLow = d.ActiveLow,
+                Pin = d.Pin,
+                HoldMs = d.HoldMs,
+                ReleaseMs = d.ReleaseMs,
+            };
+        }
+
+        return doc;
+    }
+
+    /// <summary>The channels this device actually has: the wire input count (not
+    /// the currently-streaming count, which follows the input source) plus the
+    /// platform's outputs.</summary>
+    private static IEnumerable<Channel> DeviceChannels(MainViewModel vm)
+    {
+        int inputs = Math.Clamp(vm.NumInputChannels, 1, Channel.AllInputs.Count);
+        foreach (var ch in Channel.AllInputs.Take(inputs)) yield return ch;
+        foreach (var ch in vm.ActiveOutputs) yield return ch;
+    }
+
+    // ── Serialization ────────────────────────────────────────────────────────
+
+    public static string Serialize(PresetDocument doc) =>
+        JsonSerializer.Serialize(doc, WriteOptions);
+
+    /// <summary>
+    /// Parse a document. Throws <see cref="InvalidDataException"/> with a
+    /// user-facing message when the file isn't one of ours or is newer than
+    /// this build understands.
+    /// </summary>
+    public static PresetDocument Deserialize(string json)
+    {
+        PresetDocument? doc;
+        try
+        {
+            doc = JsonSerializer.Deserialize<PresetDocument>(json, ReadOptions);
+        }
+        catch (JsonException ex)
+        {
+            throw new InvalidDataException($"Not a valid preset file: {ex.Message}");
+        }
+
+        if (doc == null)
+            throw new InvalidDataException("Not a valid preset file: the file is empty.");
+
+        if (doc.SchemaVersion <= 0 || doc.Channels.Count == 0)
+            throw new InvalidDataException("Not a valid preset file: no channel data found.");
+
+        if (doc.SchemaVersion > PresetDocument.CurrentSchemaVersion)
+        {
+            throw new InvalidDataException(
+                $"This preset was written by a newer version of DSPi Console " +
+                $"(format {doc.SchemaVersion}, this build reads {PresetDocument.CurrentSchemaVersion}).");
+        }
+
+        return doc;
+    }
+
+    // ── Apply ────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Push a document to the device. Call from the UI thread: the ViewModel
+    /// setters raise change notifications. Values for features this firmware
+    /// lacks are skipped and named in the report rather than written blindly.
+    /// </summary>
+    public static async Task<PresetApplyReport> ApplyAsync(
+        PresetDocument doc, MainViewModel vm, PresetApplyOptions options,
+        IProgress<double>? progress = null)
+    {
+        var report = new PresetApplyReport();
+
+        // Built by hand rather than ToDictionary: a hand-edited file with a
+        // duplicated channel id should apply the last one, not throw.
+        var byId = new Dictionary<int, PresetChannelBlock>();
+        foreach (var c in doc.Channels)
+            byId[c.ChannelId] = c;
+
+        var deviceChannels = DeviceChannels(vm).ToList();
+        var deviceIds = new HashSet<int>(deviceChannels.Select(c => (int)c.Id));
+
+        foreach (var block in doc.Channels)
+            if (!deviceIds.Contains(block.ChannelId))
+                report.MissingChannels.Add(block.Name);
+
+        // Work out the total up front so the progress bar doesn't jump.
+        int totalSteps = (options.AudioProcessing ? deviceChannels.Count + doc.Matrix.Count + 1 : 0)
+                       + (options.HardwareIo ? 1 : 0);
+        int step = 0;
+        void Tick() => progress?.Report(totalSteps == 0 ? 1.0 : Math.Min(1.0, ++step / (double)totalSteps));
+
+        if (options.AudioProcessing)
+        {
+            // PEQ link state first: a linked input pair mirrors every filter and
+            // preamp write to its partner, so applying it after the channels
+            // would let the device's *current* link state rewrite what we just
+            // pushed.
+            var linked = doc.Global.InputPairLinked;
+            for (int pair = 0; pair < linked.Length; pair++)
+                if (vm.GetInputPairLinked(pair) != linked[pair])
+                    vm.SetInputPairLinked(pair, linked[pair]);
+
+            await ApplyChannelsAsync(vm, byId, deviceChannels, report, Tick);
+            ApplyMatrix(vm, doc, report, Tick);
+            await ApplyFeatureBlocksAsync(vm, doc, report);
+            Tick();
+        }
+
+        if (options.VolumeLevels)
+            ApplyVolumes(vm, doc, report);
+
+        if (options.HardwareIo)
+        {
+            await ApplyIoAsync(vm, doc, report);
+            Tick();
+        }
+
+        progress?.Report(1.0);
+        return report;
+    }
+
+    private static async Task ApplyChannelsAsync(
+        MainViewModel vm, Dictionary<int, PresetChannelBlock> byId,
+        List<Channel> deviceChannels, PresetApplyReport report, Action tick)
+    {
+        // Disable outputs first, then enable — an enable can conflict with a
+        // channel the document is about to turn off (PDM vs S/PDIF 3 on RP2040).
+        foreach (bool enabling in new[] { false, true })
+        {
+            foreach (var channel in deviceChannels)
+            {
+                if (!channel.IsOutput) continue;
+                if (!byId.TryGetValue((int)channel.Id, out var block)) continue;
+                if (block.Enabled != enabling) continue;
+
+                int outIndex = vm.GetOutputIndex((int)channel.Id);
+                if (outIndex < 0) continue;
+                if (vm.IsOutputEnabled(outIndex) == block.Enabled) continue;
+
+                if (block.Enabled && vm.WouldConflict(outIndex))
+                {
+                    report.Skipped.Add($"{block.Name} could not be enabled (conflicts with another output)");
+                    continue;
+                }
+
+                vm.SetOutputEnabled(outIndex, block.Enabled);
+                vm.SetOutputEnableUsb(outIndex, block.Enabled);
+            }
+        }
+
+        foreach (var channel in deviceChannels)
+        {
+            int id = (int)channel.Id;
+            if (!byId.TryGetValue(id, out var block))
+            {
+                tick();
+                continue;
+            }
+
+            if (!string.IsNullOrWhiteSpace(block.Name) && block.Name != vm.GetChannelName(channel))
+                vm.SetChannelName(channel, block.Name);
+
+            vm.SetDelay(id, block.DelayMs);
+
+            if (channel.IsOutput)
+            {
+                vm.SetChannelGain(id, block.GainDb);
+                int outIndex = vm.GetOutputIndex(id);
+                if (outIndex >= 0 && vm.GetOutputMuted(outIndex) != block.Muted)
+                {
+                    // Two independent caches hold output mute: _outputMuted
+                    // (matrix window) and _channelMutes (main window meters and
+                    // mute buttons). Both setters send the same SET_OUTPUT_MUTE,
+                    // so writing only one leaves half the UI showing stale state
+                    // until the next bulk refresh. Write both; the duplicate
+                    // transfer is idempotent.
+                    vm.SetOutputMuted(outIndex, block.Muted);
+                    vm.SetChannelMute(id, block.Muted);
+                }
+            }
+
+            // EQ. A document that carries no bands for this channel leaves its
+            // EQ alone (same rule as a filter file with no PEQ section); one
+            // that carries some flattens the rest, so an imported channel is
+            // never a blend of two presets. Bands past this channel's count are
+            // dropped (a 12-band source read by a 10-band build).
+            if (block.Eq.Count > 0)
+            {
+                for (int band = 0; band < channel.BandCount; band++)
+                {
+                    var fp = band < block.Eq.Count
+                        ? Sanitize(vm, block.Eq[band].ToFilterParams(), report)
+                        : new FilterParams(FilterType.Flat, 1000f, 0.707f, 0f);
+                    await vm.SetFilter(id, band, fp);
+                    report.BandsApplied++;
+                }
+            }
+
+            if (channel.IsOutput && vm.CrossoverSupported && block.Crossover.Count > 0)
+            {
+                for (int b = 0; b < CrossoverFilter.MaxXoverBands; b++)
+                {
+                    var fp = b < block.Crossover.Count
+                        ? block.Crossover[b].ToFilterParams()
+                        : new FilterParams(FilterType.Flat, 1000f, 0.707f, 0f);
+                    await vm.SetXoverFilter(id, b, fp);
+                    report.CrossoverBandsApplied++;
+                }
+            }
+
+            report.ChannelsApplied++;
+            tick();
+        }
+
+        if (!vm.CrossoverSupported && byId.Values.Any(c => c.Crossover.Count > 0))
+            report.Skipped.Add("Crossover bands (not supported by this firmware)");
+    }
+
+    /// <summary>
+    /// Neutralise a band the connected firmware can't represent. A Linkwitz
+    /// Transform is sent as an 18-byte SET that pre-V22 firmware doesn't parse,
+    /// and a bypass flag on firmware without band bypass would leave the band
+    /// audible while the app believed it was muted. Both are reported once.
+    /// </summary>
+    private static FilterParams Sanitize(MainViewModel vm, FilterParams fp, PresetApplyReport report)
+    {
+        if (fp.Type == FilterType.LinkwitzTransform && !vm.LinkwitzTransformSupported)
+        {
+            const string note = "Linkwitz Transform bands (not supported by this firmware) were set to Off";
+            if (!report.Skipped.Contains(note)) report.Skipped.Add(note);
+            return new FilterParams(FilterType.Flat, 1000f, 0.707f, 0f);
+        }
+
+        if (fp.Bypass && !vm.BandBypassSupported)
+        {
+            const string note = "Per-band bypass (not supported by this firmware) was cleared";
+            if (!report.Skipped.Contains(note)) report.Skipped.Add(note);
+            fp.Bypass = false;
+        }
+
+        return fp;
+    }
+
+    private static void ApplyMatrix(MainViewModel vm, PresetDocument doc, PresetApplyReport report, Action tick)
+    {
+        int outputCount = Math.Min(vm.ActiveOutputs.Count, MainViewModel.MatrixMaxOutputs);
+        foreach (var cp in doc.Matrix)
+        {
+            if (cp.Input < 0 || cp.Input >= MainViewModel.MatrixMaxInputs ||
+                cp.Output < 0 || cp.Output >= outputCount)
+            {
+                tick();
+                continue;
+            }
+
+            vm.SetMatrixRoute(cp.Input, cp.Output, cp.Enabled, cp.GainDb, cp.Invert);
+            report.CrosspointsApplied++;
+            tick();
+        }
+    }
+
+    private static async Task ApplyFeatureBlocksAsync(MainViewModel vm, PresetDocument doc, PresetApplyReport report)
+    {
+        // Preamps, bypass, input source. (PEQ link is applied earlier — see
+        // ApplyAsync — because it changes what a per-channel write does.)
+        var g = doc.Global;
+        int inputs = Math.Clamp(vm.NumInputChannels, 1, g.InputPreampsDb.Length);
+        for (int wireIn = 0; wireIn < inputs; wireIn++)
+            vm.SetInputPreampAt(wireIn, g.InputPreampsDb[wireIn]);
+
+        vm.Bypass = g.Bypass;
+
+        if (vm.InputSourceSupported)
+        {
+            var source = (InputSource)g.InputSource;
+            if (vm.ActiveInputSource != source)
+                await vm.SetInputSourceAsync(source);
+        }
+        else if (g.InputSource != (byte)InputSource.Usb)
+        {
+            report.Skipped.Add("Input source (not supported by this firmware)");
+        }
+
+        if (vm.LgSoundSyncSupported)
+            vm.LgSoundSyncEnabled = g.LgSoundSyncEnabled;
+        else if (g.LgSoundSyncEnabled)
+            report.Skipped.Add("LG Sound Sync (not supported by this firmware)");
+
+        // Loudness
+        vm.LoudnessRefSPL = doc.Loudness.RefSpl;
+        vm.LoudnessIntensity = doc.Loudness.IntensityPct;
+        if (vm.LoudnessMaskSupported)
+            vm.LoudnessOutputMask = doc.Loudness.OutputMask;
+        vm.LoudnessEnabled = doc.Loudness.Enabled;
+
+        // Crossfeed
+        vm.CrossfeedPreset = doc.Crossfeed.Preset;
+        vm.CrossfeedFreq = doc.Crossfeed.FreqHz;
+        vm.CrossfeedFeed = doc.Crossfeed.FeedDb;
+        vm.CrossfeedItd = doc.Crossfeed.Itd;
+        if (vm.CrossfeedMaskSupported)
+            vm.CrossfeedOutputPairMask = doc.Crossfeed.OutputPairMask;
+        vm.CrossfeedEnabled = doc.Crossfeed.Enabled;
+
+        // Volume leveller
+        vm.LevellerSpeed = doc.Leveller.Speed;
+        vm.LevellerLookahead = doc.Leveller.Lookahead;
+        vm.LevellerAmount = doc.Leveller.AmountPct;
+        vm.LevellerMaxGainDb = doc.Leveller.MaxGainDb;
+        vm.LevellerGateDb = doc.Leveller.GateDb;
+        if (vm.LevellerMasksSupported)
+        {
+            vm.LevellerDetectorMask = doc.Leveller.DetectorMask;
+            vm.LevellerApplyMask = doc.Leveller.ApplyMask;
+        }
+        vm.LevellerEnabled = doc.Leveller.Enabled;
+
+        // Psychoacoustic bass
+        if (doc.Psybass is { } pb)
+        {
+            if (vm.PsybassSupported)
+            {
+                vm.PsybassCutoffHz = pb.CutoffHz;
+                vm.PsybassHarmonicsDb = pb.HarmonicsDb;
+                vm.PsybassDriveDb = pb.DriveDb;
+                vm.PsybassCharacterPct = pb.CharacterPct;
+                vm.PsybassOriginalDb = pb.OriginalDb;
+                vm.PsybassOutputMask = pb.OutputMask;
+                vm.PsybassEnabled = pb.Enabled;
+            }
+            else
+            {
+                report.Skipped.Add("Psychoacoustic bass (not supported by this firmware)");
+            }
+        }
+
+        // Stereo upmixer
+        if (doc.Upmix is { } um)
+        {
+            if (vm.UpmixSupported)
+            {
+                vm.UpmixCenterMode = um.CenterMode;
+                vm.UpmixSurroundMode = um.SurroundMode;
+                vm.UpmixStrengthPct = um.StrengthPct;
+                vm.UpmixCenterWidthPct = um.CenterWidthPct;
+                vm.UpmixThresholdPct = um.ThresholdPct;
+                vm.UpmixAttackMs = um.AttackMs;
+                vm.UpmixReleaseMs = um.ReleaseMs;
+                vm.UpmixDetectorHpfHz = um.DetectorHpfHz;
+                vm.UpmixSurroundDelayMs = um.SurroundDelayMs;
+                vm.UpmixSurroundHpfHz = um.SurroundHpfHz;
+                vm.UpmixSurroundLpfHz = um.SurroundLpfHz;
+                vm.UpmixDecorrPct = um.DecorrPct;
+                vm.UpmixPresenceDb = um.PresenceDb;
+                vm.UpmixEnabled = um.Enabled;
+            }
+            else
+            {
+                report.Skipped.Add("Stereo upmixer (not supported by this device)");
+            }
+        }
+    }
+
+    private static void ApplyVolumes(MainViewModel vm, PresetDocument doc, PresetApplyReport report)
+    {
+        // Master volume is only per-preset when the device says so; in
+        // independent mode it is device-global and saved separately, so
+        // overwriting it from a file would fight the user's own setting.
+        if (vm.MasterVolumeMode == 1)
+            vm.MasterVolumeDb = doc.Global.MasterVolumeDb;
+        else
+            report.Skipped.Add("Master volume (device is in independent master-volume mode)");
+
+        vm.UserVolumeDb = doc.Global.UserVolumeDb;
+    }
+
+    private static async Task ApplyIoAsync(MainViewModel vm, PresetDocument doc, PresetApplyReport report)
+    {
+        var io = doc.Io;
+        var rejections = new List<string>();
+
+        // Every pin/clock setter issues a blocking control transfer. They
+        // marshal their own change notifications, and the Hardware settings
+        // page calls them from a background task for exactly this reason:
+        // running the block on the UI thread would freeze the window.
+        await Task.Run(() => ApplyIoPins(vm, io, rejections));
+        report.Skipped.AddRange(rejections);
+
+        if (io.DacHwMute is { } dm)
+        {
+            if (vm.DacHwMuteSupported)
+            {
+                await vm.ApplyDacHwMuteAsync(new DacHwMuteConfig
+                {
+                    Enabled = dm.Enabled,
+                    ActiveLow = dm.ActiveLow,
+                    Pin = dm.Pin,
+                    HoldMs = dm.HoldMs,
+                    ReleaseMs = dm.ReleaseMs,
+                });
+            }
+            else
+            {
+                report.Skipped.Add("External DAC hardware mute (not supported by this firmware)");
+            }
+        }
+    }
+
+    /// <summary>
+    /// The GPIO, clocking and input-wiring writes. Synchronous and blocking —
+    /// call it from a background task. Refusals are collected rather than
+    /// thrown: the setters answer with a <see cref="PinConfigResult"/>.
+    /// </summary>
+    private static void ApplyIoPins(MainViewModel vm, PresetIoBlock io, List<string> rejections)
+    {
+        // The pin setters answer with a PinConfigResult rather than throwing —
+        // a GPIO that is already in use, or invalid on this board, is refused
+        // silently. Name the refusals so a half-applied wiring change is
+        // visible instead of being discovered later as no audio.
+        void Try(string what, Func<byte> set)
+        {
+            byte status = set();
+            if (status == PinConfigResult.Success) return;
+            rejections.Add($"{what} rejected by the device ({DescribePinResult(status)})");
+        }
+
+        // Slot types before pins: a slot switching to I2S changes what its pin
+        // assignment means, and the VM regenerates auto channel names from it.
+        for (int slot = 0; slot < Math.Min(io.OutputSlotTypes.Length, vm.NumOutputSlots); slot++)
+        {
+            int s = slot;
+            Try($"Output {s + 1} type", () => vm.SetOutputSlotType(s, (OutputSlotType)io.OutputSlotTypes[s]));
+        }
+
+        // Only the pin outputs this board actually has: the ids are contiguous
+        // but PDM sits at a different one per platform (2 on RP2040, 4 on
+        // RP2350), and writing an id the board lacks just earns InvalidOutput.
+        foreach (var pinOutput in HardwarePins.AllPinOutputs(vm.Platform))
+        {
+            if (pinOutput.Id < 0 || pinOutput.Id >= io.OutputPins.Length) continue;
+            byte want = io.OutputPins[pinOutput.Id];
+            if (vm.GetOutputPinValue(pinOutput.Id) == want) continue;
+
+            byte status = vm.SetOutputPinValue(pinOutput.Id, want);
+
+            // The firmware refuses to move the PDM pin while PDM is enabled.
+            // Cycle it the way the Hardware settings page does, then restore
+            // whatever enable state the output is supposed to be in.
+            if (status == PinConfigResult.OutputActive && pinOutput.SlotIndex < 0)
+            {
+                int pdmIndex = vm.ActiveOutputs.Count - 1;
+                vm.Device.SetOutputEnable(pdmIndex, false);
+                status = vm.SetOutputPinValue(pinOutput.Id, want);
+                vm.Device.SetOutputEnable(pdmIndex, vm.IsOutputEnabled(pdmIndex));
+            }
+
+            if (status != PinConfigResult.Success)
+                rejections.Add($"{pinOutput.Name} GPIO rejected by the device ({DescribePinResult(status)})");
+        }
+
+        Try("I2S BCK pin", () => vm.SetI2SBckPin(io.I2sBckPin));
+        Try("MCK enable", () => vm.SetMckEnable(io.MckEnabled));
+        Try("MCK pin", () => vm.SetMckPin(io.MckPin));
+        Try("MCK multiplier", () => vm.SetMckMultiplier(io.MckMultiplier));
+
+        if (vm.I2sClockModeSupported)
+            vm.SetI2sClockMode(io.I2sClockMode);
+        if (vm.I2sClockPinModeSupported)
+        {
+            Try("I2S clock pin mode", () => vm.SetI2sClockPinMode(io.I2sClockPinMode));
+            Try("I2S slave BCK pin", () => vm.SetI2sBckPinSlave(io.I2sBckPinSlave));
+        }
+
+        // S/PDIF inputs: pins first, then the enable mask, so an input being
+        // switched on is already pointed at the right GPIO.
+        Try("S/PDIF RX pin", () => vm.SetSpdifRxPin(io.SpdifRxPins[0]));
+        if (vm.MultiSpdifSupported)
+        {
+            for (int i = 1; i < io.SpdifRxPins.Length; i++)
+            {
+                int idx = i;
+                Try($"S/PDIF {idx + 1} RX pin", () => vm.SetSpdifRxPin(io.SpdifRxPins[idx], idx));
+            }
+            for (int i = 1; i <= 2; i++)
+            {
+                int idx = i;
+                Try($"S/PDIF input {idx + 1}",
+                    () => vm.SetSpdifInputEnable(idx, (io.SpdifEnabledExt & (1 << (idx - 1))) != 0));
+            }
+        }
+        else if (io.SpdifEnabledExt != 0)
+        {
+            rejections.Add("Additional S/PDIF inputs (not supported by this firmware)");
+        }
+
+        // I2S input: pins, then the channel count that decides how many pairs
+        // are live, then the master rate.
+        for (int pair = 0; pair < Math.Min(io.I2sRxPins.Length, vm.I2sMaxPairs); pair++)
+        {
+            int p = pair;
+            Try($"I2S serial data {p + 1} pin", () => vm.SetI2sRxPin(io.I2sRxPins[p], p));
+        }
+        if (io.I2sInputChannels is 2 or 4 or 6 or 8)
+            Try("I2S input channels",
+                () => vm.SetI2sInputChannels(Math.Min(io.I2sInputChannels, vm.I2sMaxInputChannels)));
+        vm.SetI2sInputRate(io.I2sInputRateHz);
+
+        if (vm.AdatSupported)
+        {
+            Try("ADAT output pin", () => vm.SetAdatPin(io.AdatPin));
+            Try("ADAT output enable", () => vm.SetAdatEnable(io.AdatEnabled));
+        }
+        else if (io.AdatEnabled)
+        {
+            rejections.Add("ADAT output (not supported by this device)");
+        }
+
+        if (vm.AdatInputSupported)
+        {
+            if (io.AdatInputPin != MainViewModel.AdatInputPinUnset)
+                Try("ADAT input pin", () => vm.SetAdatInputPin(io.AdatInputPin));
+            Try("ADAT input clock mode", () => vm.SetAdatInputClockMode(io.AdatInputClockMode));
+            Try("ADAT input enable", () => vm.SetAdatInputEnable(io.AdatInputEnabled));
+        }
+        else if (io.AdatInputEnabled)
+        {
+            rejections.Add("ADAT input (not supported by this device)");
+        }
+    }
+
+    private static string DescribePinResult(byte status) => status switch
+    {
+        PinConfigResult.InvalidPin => "invalid pin",
+        PinConfigResult.PinInUse => "pin already in use",
+        PinConfigResult.InvalidOutput => "invalid output",
+        PinConfigResult.OutputActive => "output is active",
+        PinConfigResult.InvalidParam => "invalid value",
+        _ => $"status 0x{status:X2}",
+    };
+}

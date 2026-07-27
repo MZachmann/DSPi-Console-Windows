@@ -53,6 +53,11 @@ public class AppSettings
     public Dictionary<int, bool> GainLocked { get; set; } = new();
     public Dictionary<int, bool> DelayLocked { get; set; } = new();
 
+    // Dashboard graph-visibility pills (key = ChannelId int). Sparse: a channel
+    // with no entry is visible. Only dashboard toggles are recorded here — the
+    // narrowed view while a channel editor is open is temporary.
+    public Dictionary<int, bool> GraphChannelVisibility { get; set; } = new();
+
     // Show the quick-save button next to the preset dropdown when dirty
     public bool ShowPresetSaveButton { get; set; } = true;
 

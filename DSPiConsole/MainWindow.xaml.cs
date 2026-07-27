@@ -53,6 +53,7 @@ public sealed partial class MainWindow : Window
     private LoudnessWindow? _loudnessWindow;
     private CrossfeedWindow? _crossfeedWindow;
     private PsychoacousticBassWindow? _psybassWindow;
+    private UpmixerWindow? _upmixerWindow;
     private VolumeLevellerWindow? _levellerWindow;
     private MatrixMixerWindow? _matrixMixerWindow;
     private TestSignalsWindow? _testSignalsWindow;
@@ -88,6 +89,9 @@ public sealed partial class MainWindow : Window
     // Inline per-channel meters: keyed by ChannelId
     private readonly Dictionary<int, HorizontalMeterBar> _channelMeters = new();
 
+    // Sidebar badge restyle callbacks (graph-visibility toggles): keyed by ChannelId
+    private readonly Dictionary<int, Action> _channelBadgeStylers = new();
+
     /// <summary>
     /// Resolve a firmware-side channel ID back to the Channel object
     /// whose metadata the UI should display. <see cref="Channel.FromId"/>
@@ -112,8 +116,25 @@ public sealed partial class MainWindow : Window
     // Dashboard rebuild debounce
     private DispatcherTimer? _dashboardDebounce;
 
-    // Dashboard header stats TextBlocks: keyed by channelId
+    // Live TextBlocks owned by the dashboard cards currently on screen, keyed by
+    // channelId. Rebuilt from _dashboardCardTexts so they only ever reference
+    // elements that are actually in the visual tree.
     private readonly Dictionary<int, TextBlock> _dashboardHeaderStats = new();
+    private readonly Dictionary<int, TextBlock> _dashboardNameTexts = new();
+
+    /// <summary>The live TextBlocks one dashboard card owns, keyed by channel id.
+    /// Collected per card because UpdateDashboardCards builds every desired card
+    /// but only inserts the new ones — registering globally from each freshly
+    /// built card would leave the maps above pointing at the discarded (off-tree)
+    /// twins of the cards that stayed put, silently freezing their stats.</summary>
+    private sealed class DashboardCardTexts
+    {
+        public readonly Dictionary<int, TextBlock> Stats = new();
+        public readonly Dictionary<int, TextBlock> Names = new();
+    }
+
+    // Per-card text registrations for the cards currently on screen: keyed by card key
+    private readonly Dictionary<string, DashboardCardTexts> _dashboardCardTexts = new();
 
     // Pre-built output channel items: keyed by output index
     private readonly Dictionary<int, ListViewItem> _outputChannelItems = new();
@@ -158,9 +179,6 @@ public sealed partial class MainWindow : Window
         // Initialize channel lists
         InitializeChannelLists();
 
-        // Initialize legend
-        InitializeLegend();
-
         // Initialize dashboard
         InitializeDashboard();
 
@@ -201,7 +219,7 @@ public sealed partial class MainWindow : Window
         };
         ViewModel.VisibilityChanged += (_, _) =>
         {
-            UpdateLegend();
+            UpdateChannelBadges();
             BodePlot.Invalidate();
         };
 
@@ -213,16 +231,18 @@ public sealed partial class MainWindow : Window
             // same sidebar names; ids 0/1 double as matrix input indices.
             if (_currentRouteNameTexts.TryGetValue(channelId, out var route))
                 route.Text = ViewModel.GetChannelName(LookupChannelById(channelId));
+            if (_dashboardNameTexts.TryGetValue(channelId, out var cardName))
+                cardName.Text = ViewModel.GetChannelName(LookupChannelById(channelId));
         };
 
         ViewModel.InputPreampExtChanged += _ =>
             DispatcherQueue.TryEnqueue(UpdateInputPreampEditor);
 
         ViewModel.ActiveOutputsChanged += (s, e) =>
-            DispatcherQueue.TryEnqueue(() => { InitializeChannelLists(); InitializeLegend(); });
+            DispatcherQueue.TryEnqueue(InitializeChannelLists);
 
         ViewModel.OutputEnabledChanged += (outputIndex, enabled) =>
-            DispatcherQueue.TryEnqueue(() => { OnOutputEnabledChanged(outputIndex, enabled); InitializeLegend(); if (DashboardPanel.Visibility == Visibility.Visible) UpdateDashboardCards(); });
+            DispatcherQueue.TryEnqueue(() => { OnOutputEnabledChanged(outputIndex, enabled); if (DashboardPanel.Visibility == Visibility.Visible) UpdateDashboardCards(); });
 
         ViewModel.MatrixOutputGainChanged += outputIndex =>
             DispatcherQueue.TryEnqueue(() => { SyncGainFromViewModel(outputIndex); BodePlot.Invalidate(); });
@@ -369,6 +389,7 @@ public sealed partial class MainWindow : Window
         _channelListItems.Clear();
         _outputChannelItems.Clear();
         _channelMeters.Clear();
+        _channelBadgeStylers.Clear();
 
         InputChannelsList.Items.Clear();
         OutputChannelsList.Items.Clear();
@@ -576,11 +597,11 @@ public sealed partial class MainWindow : Window
         };
         nameBox.LostFocus += (s, e) => CommitSidebarName();
 
-        // Modern pill-shaped badge with glow indicator
+        // Pill-shaped badge — doubles as the graph-visibility toggle (moved here
+        // from the old legend under the graph): channel color while shown on the
+        // graph, grey once hidden. Click to toggle.
         var badge = new Border
         {
-            Background = new SolidColorBrush(Color.FromArgb(15, channel.Color.R, channel.Color.G, channel.Color.B)),
-            BorderBrush = new SolidColorBrush(Color.FromArgb(80, channel.Color.R, channel.Color.G, channel.Color.B)),
             BorderThickness = new Thickness(1),
             CornerRadius = new CornerRadius(10),
             Padding = new Thickness(7, 2, 7, 2),
@@ -595,50 +616,76 @@ public sealed partial class MainWindow : Window
             HorizontalAlignment = HorizontalAlignment.Center
         };
 
-        // Glowing indicator dot with layered effect
-        var dotContainer = new Grid
-        {
-            Width = 8,
-            Height = 8,
-            VerticalAlignment = VerticalAlignment.Center
-        };
-
-        // Outer glow
-        var dotGlow = new Ellipse
-        {
-            Width = 8,
-            Height = 8,
-            Fill = new SolidColorBrush(Color.FromArgb(100, channel.Color.R, channel.Color.G, channel.Color.B))
-        };
-        dotContainer.Children.Add(dotGlow);
-
-        // Inner bright dot
-        var dotCore = new Ellipse
-        {
-            Width = 5,
-            Height = 5,
-            Fill = new SolidColorBrush(channel.Color),
-            HorizontalAlignment = HorizontalAlignment.Center,
-            VerticalAlignment = VerticalAlignment.Center
-        };
-        //dotContainer.Children.Add(dotCore);
-
-        //badgeContent.Children.Add(dotContainer);
-
         var badgeText = new TextBlock
         {
             Text = channel.Descriptor,
             FontSize = 9,
             FontWeight = Microsoft.UI.Text.FontWeights.SemiBold,
-            Foreground = new SolidColorBrush(Color.FromArgb(230, channel.Color.R, channel.Color.G, channel.Color.B)),
             VerticalAlignment = VerticalAlignment.Center,
             CharacterSpacing = 80
         };
         badgeContent.Children.Add(badgeText);
-
         badge.Child = badgeContent;
-        Grid.SetColumn(badge, 2);
-        grid.Children.Add(badge);
+
+        void StyleBadge()
+        {
+            bool graphVisible = ViewModel.GetChannelVisibility(channel);
+            var c = channel.Color;
+            badge.Background = new SolidColorBrush(graphVisible
+                ? Color.FromArgb(15, c.R, c.G, c.B) : Color.FromArgb(10, 150, 150, 150));
+            badge.BorderBrush = new SolidColorBrush(graphVisible
+                ? Color.FromArgb(80, c.R, c.G, c.B) : Color.FromArgb(60, 150, 150, 150));
+            badgeText.Foreground = new SolidColorBrush(graphVisible
+                ? Color.FromArgb(230, c.R, c.G, c.B) : Color.FromArgb(150, 165, 165, 165));
+        }
+        StyleBadge();
+        _channelBadgeStylers[(int)channel.Id] = StyleBadge;
+
+        // Oversized hit area (negative margin cancels the padding, so the layout
+        // is unchanged): a slightly-off click still toggles the badge instead of
+        // selecting the channel row. A chromeless Button rather than a Border —
+        // the ListView doesn't select the row when the click lands on a button,
+        // where handled Tapped/Pointer events on a plain element wouldn't stop
+        // SelectionMode="Single". Right-clicks pass through to the row's context
+        // menu as usual.
+        var badgeHit = new Button
+        {
+            Style = (Style)RootGrid.Resources["BadgeHitButtonStyle"],
+            Padding = new Thickness(10, 8, 10, 8),
+            Margin = new Thickness(-10, -8, -10, -8),
+            VerticalAlignment = VerticalAlignment.Center,
+            Content = badge
+        };
+        badgeHit.Click += (s, e) => ViewModel.ToggleChannelVisibility(channel);
+        // Channel selection is driven by the row's own Tapped handler
+        // (OnChannelItemTapped), and Tapped bubbles up from the badge no matter
+        // what the Button does with the pointer events — stop it here, and undo
+        // any stray built-in ListView highlight the click may have caused.
+        badgeHit.Tapped += (s, e) =>
+        {
+            e.Handled = true;
+            UpdateChannelListSelection();
+            // Pressing the pill makes the button capture the pointer, so the row
+            // under the cursor receives a synthetic pointer-exit and drops its
+            // hover visual (and a linked pair drops the partner's forced one)
+            // even though the cursor never moved. Restore hover on this row and,
+            // for linked inputs, its partner once the click has settled.
+            void RestoreHover()
+            {
+                VisualStateManager.GoToState(item, "PointerOver", true);
+                if (!channel.IsOutput)
+                {
+                    var partner = GetPairedInputItem(item);
+                    if (partner != null)
+                        VisualStateManager.GoToState(partner, "PointerOver", true);
+                }
+            }
+            RestoreHover();
+            DispatcherQueue.TryEnqueue(
+                Microsoft.UI.Dispatching.DispatcherQueuePriority.Low, RestoreHover);
+        };
+        Grid.SetColumn(badgeHit, 2);
+        grid.Children.Add(badgeHit);
 
         // Inline meter bar
         var meter = new HorizontalMeterBar
@@ -655,140 +702,12 @@ public sealed partial class MainWindow : Window
         return item;
     }
 
-    // Channel-id signature of the last-built legend. Rebuild requests arrive from
-    // several events that often haven't changed the channel set; recreating the
-    // pills anyway renders a frame at natural widths before the deferred
-    // uniform-width pass, which reads as flicker when the events repeat.
-    private string? _legendSignature;
-
-    private void InitializeLegend()
+    /// <summary>Repaint every sidebar badge from its channel's current graph
+    /// visibility (the badges replaced the old legend pills under the graph).</summary>
+    private void UpdateChannelBadges()
     {
-        // Inputs are always shown (the active set follows the input source);
-        // outputs only when enabled.
-        var channels = new List<Channel>(ViewModel.ActiveInputs);
-        for (int o = 0; o < ViewModel.ActiveOutputs.Count; o++)
-            if (ViewModel.IsOutputEnabled(o))
-                channels.Add(ViewModel.ActiveOutputs[o]);
-
-        string signature = string.Join(",", channels.Select(c => (int)c.Id));
-        if (signature == _legendSignature)
-        {
-            UpdateLegend(); // same pills — just repaint visibility state
-            return;
-        }
-        _legendSignature = signature;
-
-        LegendPanel.Children.Clear();
-        foreach (var channel in channels)
-            AddLegendButton(channel);
-
-        // Uniform pill width: size every button to the widest one so input and
-        // output pills line up regardless of label length. Must run after layout —
-        // pre-layout Measure under-reports (template padding not yet applied).
-        DispatcherQueue.TryEnqueue(Microsoft.UI.Dispatching.DispatcherQueuePriority.Low,
-            () => ApplyUniformLegendWidth());
-
-        UpdateLegend();
-    }
-
-    /// <summary>Equalize legend pill widths from their laid-out ActualWidth.
-    /// Retries a few frames if the panel hasn't been laid out yet (first build
-    /// happens before the window is shown).</summary>
-    private void ApplyUniformLegendWidth(int attempt = 0)
-    {
-        double widest = 0;
-        bool unmeasured = false;
-        foreach (var child in LegendPanel.Children)
-            if (child is Button b)
-            {
-                if (b.ActualWidth <= 0) unmeasured = true;
-                widest = Math.Max(widest, b.ActualWidth);
-            }
-
-        if (unmeasured)
-        {
-            if (attempt < 5)
-                DispatcherQueue.TryEnqueue(Microsoft.UI.Dispatching.DispatcherQueuePriority.Low,
-                    () => ApplyUniformLegendWidth(attempt + 1));
-            return;
-        }
-        if (widest <= 0) return;
-
-        foreach (var child in LegendPanel.Children)
-            if (child is Button b) b.Width = Math.Ceiling(widest);
-    }
-
-    private void AddLegendButton(Channel channel)
-    {
-        var btn = new Button
-        {
-            Tag = channel,
-            Padding = new Thickness(8, 4, 8, 4),
-            Background = new SolidColorBrush(Colors.Transparent),
-            BorderThickness = new Thickness(0)
-        };
-
-        var panel = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 6 };
-
-        var indicator = new Ellipse
-        {
-            Width = 6,
-            Height = 6,
-            Fill = new SolidColorBrush(channel.Color)
-        };
-
-        var label = new TextBlock
-        {
-            Text = channel.Descriptor,
-            FontSize = 10,
-            FontWeight = Microsoft.UI.Text.FontWeights.Bold,
-            Foreground = (Brush)Application.Current.Resources["TextFillColorSecondaryBrush"]
-        };
-
-        panel.Children.Add(indicator);
-        panel.Children.Add(label);
-        btn.Content = panel;
-
-        btn.Click += (s, e) =>
-        {
-            if (s is Button b && b.Tag is Channel ch)
-            {
-                ViewModel.ToggleChannelVisibility(ch);
-            }
-        };
-
-        LegendPanel.Children.Add(btn);
-    }
-
-    private void UpdateLegend()
-    {
-        foreach (var child in LegendPanel.Children)
-        {
-            if (child is Button btn && btn.Tag is Channel channel)
-            {
-                bool isVisible = ViewModel.GetChannelVisibility(channel);
-                var panel = btn.Content as StackPanel;
-                if (panel != null)
-                {
-                    var ellipse = panel.Children[0] as Ellipse;
-                    var text = panel.Children[1] as TextBlock;
-
-                    if (ellipse != null)
-                    {
-                        ellipse.Fill = new SolidColorBrush(isVisible ? channel.Color : Colors.Gray);
-                        ellipse.Opacity = isVisible ? 1.0 : 0.5;
-                    }
-
-                    if (text != null)
-                    {
-                        text.Opacity = isVisible ? 1.0 : 0.5;
-                    }
-                }
-
-                btn.Background = new SolidColorBrush(
-                    isVisible ? Color.FromArgb(38, channel.Color.R, channel.Color.G, channel.Color.B) : Colors.Transparent);
-            }
-        }
+        foreach (var styler in _channelBadgeStylers.Values)
+            styler();
     }
 
     private void ScheduleDashboardRefresh()
@@ -806,7 +725,7 @@ public sealed partial class MainWindow : Window
 
     private void InitializeDashboard()
     {
-        _dashboardHeaderStats.Clear();
+        _dashboardCardTexts.Clear();
 
         var savedTransitions = DashboardPanel.ChildrenTransitions;
         DashboardPanel.ChildrenTransitions = new Microsoft.UI.Xaml.Media.Animation.TransitionCollection();
@@ -815,16 +734,19 @@ public sealed partial class MainWindow : Window
 
         if (!ViewModel.IsDeviceConnected)
         {
+            RebuildDashboardTextMaps();
             DashboardPanel.ChildrenTransitions = savedTransitions;
             return;
         }
 
-        foreach (var (key, card) in BuildDashboardCards())
+        foreach (var (key, card, texts) in BuildDashboardCards())
         {
             card.Tag = key;
             DashboardPanel.Children.Add(card);
+            _dashboardCardTexts[key] = texts;
         }
 
+        RebuildDashboardTextMaps();
         DashboardPanel.ChildrenTransitions = savedTransitions;
     }
 
@@ -832,7 +754,6 @@ public sealed partial class MainWindow : Window
     {
         if (!ViewModel.IsDeviceConnected) return;
 
-        _dashboardHeaderStats.Clear();
         var desired = BuildDashboardCards();
         var desiredKeys = desired.Select(d => d.key).ToList();
 
@@ -841,7 +762,10 @@ public sealed partial class MainWindow : Window
         {
             var key = ((FrameworkElement)DashboardPanel.Children[i]).Tag as string;
             if (key == null || !desiredKeys.Contains(key))
+            {
                 DashboardPanel.Children.RemoveAt(i);
+                if (key != null) _dashboardCardTexts.Remove(key);
+            }
         }
 
         // Get current keys after removal
@@ -850,53 +774,86 @@ public sealed partial class MainWindow : Window
             .Select(c => c.Tag as string)
             .ToList();
 
-        // Add missing cards at correct positions
+        // Add missing cards at correct positions. Cards that stayed put keep the
+        // TextBlocks they already had — only the freshly inserted ones register.
         for (int i = 0; i < desired.Count; i++)
         {
-            var (key, card) = desired[i];
+            var (key, card, texts) = desired[i];
             if (!currentKeys.Contains(key))
             {
                 card.Tag = key;
                 DashboardPanel.Children.Insert(Math.Min(i, DashboardPanel.Children.Count), card);
                 currentKeys.Insert(Math.Min(i, currentKeys.Count), key);
+                _dashboardCardTexts[key] = texts;
             }
+        }
+
+        RebuildDashboardTextMaps();
+    }
+
+    /// <summary>Flatten the per-card registrations into the channel-keyed maps the
+    /// live-refresh helpers use. Each channel appears on exactly one card.</summary>
+    private void RebuildDashboardTextMaps()
+    {
+        _dashboardHeaderStats.Clear();
+        _dashboardNameTexts.Clear();
+        foreach (var texts in _dashboardCardTexts.Values)
+        {
+            foreach (var (id, tb) in texts.Stats) _dashboardHeaderStats[id] = tb;
+            foreach (var (id, tb) in texts.Names) _dashboardNameTexts[id] = tb;
         }
     }
 
-    private List<(string key, FrameworkElement card)> BuildDashboardCards()
+    private List<(string key, FrameworkElement card, DashboardCardTexts texts)> BuildDashboardCards()
     {
-        var cards = new List<(string key, FrameworkElement card)>();
+        var cards = new List<(string key, FrameworkElement card, DashboardCardTexts texts)>();
 
-        // Stereo Input Card (always shown when connected)
-        cards.Add(("input", CreateStereoDashboardCard("STEREO INPUT (USB)", Channel.MasterLeft, Channel.MasterRight, false)));
-
-        // Build output cards for enabled channels, pairing stereo L/R
-        var outputs = ViewModel.ActiveOutputs;
-        var processed = new HashSet<int>();
-
-        for (int o = 0; o < outputs.Count; o++)
+        // Input cards: the active input set (2 on a stereo source, up to 8 on
+        // USB/ADAT/I2S), paired L/R the same way the sidebar lists them.
+        var inputs = ViewModel.ActiveInputs;
+        for (int i = 0; i < inputs.Count; i += 2)
         {
-            if (!ViewModel.IsOutputEnabled(o) || processed.Contains(o)) continue;
-
-            var ch = outputs[o];
-
-            // Check for stereo pair: consecutive L/R channels with adjacent IDs
-            int pairIndex = -1;
-            if (o + 1 < outputs.Count && (int)outputs[o + 1].Id == (int)ch.Id + 1 && ViewModel.IsOutputEnabled(o + 1))
-                pairIndex = o + 1;
-
-            if (pairIndex >= 0)
+            var texts = new DashboardCardTexts();
+            if (i + 1 < inputs.Count)
             {
-                var left = ch;
-                var right = outputs[pairIndex];
-                cards.Add(($"{left.ShortName}-{right.ShortName}", CreateStereoDashboardCard($"{left.Name} / {right.Name}", left, right, true)));
-                processed.Add(o);
-                processed.Add(pairIndex);
+                var (left, right) = (inputs[i], inputs[i + 1]);
+                cards.Add(($"in-{left.ShortName}-{right.ShortName}",
+                    CreateStereoDashboardCard(left, right, false, texts), texts));
             }
             else
             {
-                cards.Add((ch.ShortName, CreateMonoDashboardCard(ch)));
-                processed.Add(o);
+                // Odd input count (a source reporting an unpaired channel).
+                cards.Add(($"in-{inputs[i].ShortName}",
+                    CreateMonoDashboardCard(inputs[i], false, texts), texts));
+            }
+        }
+
+        // Build output cards for enabled channels, pairing stereo L/R.
+        var outputs = ViewModel.ActiveOutputs;
+
+        for (int o = 0; o < outputs.Count; o++)
+        {
+            if (!ViewModel.IsOutputEnabled(o)) continue;
+
+            var texts = new DashboardCardTexts();
+
+            // Stereo pairs are fixed by position — (0,1), (2,3), … — so a pair
+            // only forms when this channel is the left member and its partner is
+            // enabled. Matching on "the next channel has the adjacent id" instead
+            // slides the pairing by one whenever a left channel is disabled,
+            // which produces cards like "SPDIF 3 R / SPDIF 4 L" and pairs the
+            // mono PDM output in as a right half. PDM always sits last at an even
+            // index, so it can never become the right half here.
+            if (o % 2 == 0 && o + 1 < outputs.Count && ViewModel.IsOutputEnabled(o + 1))
+            {
+                var (left, right) = (outputs[o], outputs[o + 1]);
+                cards.Add(($"{left.ShortName}-{right.ShortName}",
+                    CreateStereoDashboardCard(left, right, true, texts), texts));
+                o++; // partner consumed
+            }
+            else
+            {
+                cards.Add((outputs[o].ShortName, CreateMonoDashboardCard(outputs[o], true, texts), texts));
             }
         }
 
@@ -927,7 +884,7 @@ public sealed partial class MainWindow : Window
         return brush;
     }
 
-    private Border CreateStereoDashboardCard(string title, Channel left, Channel right, bool showDelay)
+    private Border CreateStereoDashboardCard(Channel left, Channel right, bool showDelay, DashboardCardTexts texts)
     {
         var card = new Border
         {
@@ -944,8 +901,8 @@ public sealed partial class MainWindow : Window
         headerGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
         headerGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
 
-        headerGrid.Children.Add(CreateChannelHeader(left, showDelay, 0));
-        headerGrid.Children.Add(CreateChannelHeader(right, showDelay, 1));
+        headerGrid.Children.Add(CreateChannelHeader(left, showDelay, 0, texts));
+        headerGrid.Children.Add(CreateChannelHeader(right, showDelay, 1, texts));
 
         mainStack.Children.Add(headerGrid);
         mainStack.Children.Add(new Border { Height = 1, Background = new SolidColorBrush(Color.FromArgb(51, 128, 128, 128)) });
@@ -974,7 +931,7 @@ public sealed partial class MainWindow : Window
         return card;
     }
 
-    private Border CreateChannelHeader(Channel channel, bool showDelay, int column)
+    private Border CreateChannelHeader(Channel channel, bool showDelay, int column, DashboardCardTexts texts)
     {
         var header = new Border
         {
@@ -992,9 +949,12 @@ public sealed partial class MainWindow : Window
             Fill = new SolidColorBrush(channel.Color)
         });
 
-        panel.Children.Add(new TextBlock
+        // Renames live in the ViewModel (and on the device) — channel.Name is only
+        // the factory default, and the sidebar, matrix and editor all show the
+        // override, so the cards have to as well.
+        var nameText = new TextBlock
         {
-            Text = channel.Name,
+            Text = ViewModel.GetChannelName(channel),
             FontSize = 11,
             FontWeight = Microsoft.UI.Text.FontWeights.Bold,
             Foreground = new SolidColorBrush(Color.FromArgb(
@@ -1002,7 +962,9 @@ public sealed partial class MainWindow : Window
                 (byte)(channel.Color.R * 0.7),
                 (byte)(channel.Color.G * 0.7),
                 (byte)(channel.Color.B * 0.7)))
-        });
+        };
+        texts.Names[(int)channel.Id] = nameText;
+        panel.Children.Add(nameText);
 
         if (showDelay)
         {
@@ -1017,7 +979,7 @@ public sealed partial class MainWindow : Window
                 Foreground = new SolidColorBrush(isMuted ? Color.FromArgb(255, 200, 80, 80) : Colors.Gray),
                 Margin = new Thickness(8, 0, 0, 0)
             };
-            _dashboardHeaderStats[(int)channel.Id] = statsText;
+            texts.Stats[(int)channel.Id] = statsText;
             panel.Children.Add(statsText);
         }
 
@@ -1161,7 +1123,7 @@ public sealed partial class MainWindow : Window
         return grid;
     }
 
-    private Border CreateMonoDashboardCard(Channel channel)
+    private Border CreateMonoDashboardCard(Channel channel, bool showDelay, DashboardCardTexts texts)
     {
         var card = new Border
         {
@@ -1172,7 +1134,7 @@ public sealed partial class MainWindow : Window
         };
 
         var stack = new StackPanel();
-        stack.Children.Add(CreateChannelHeader(channel, true, 0));
+        stack.Children.Add(CreateChannelHeader(channel, showDelay, 0, texts));
         stack.Children.Add(new Border { Height = 1, Background = new SolidColorBrush(Color.FromArgb(51, channel.Color.R, channel.Color.G, channel.Color.B)) });
         stack.Children.Add(CreateDashboardFilterList(channel));
 
@@ -1984,7 +1946,7 @@ public sealed partial class MainWindow : Window
         if (bypassSupported)
             grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });    // Bypass toggle
         grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(60) });
-        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(150) }); // Type
+        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(170) }); // Type
         grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(72) }); // Freq
         grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(56) }); // Q
         grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(54) }); // Gain
@@ -2071,7 +2033,7 @@ public sealed partial class MainWindow : Window
         // bass-extension tool that only makes sense on outputs feeding speakers.
         if (channel.IsOutput && ViewModel.LinkwitzTransformSupported)
             typeItems.Add(("Linkwitz Transform", FilterType.LinkwitzTransform));
-        var typeCombo = new ComboBox { Width = 150, Tag = (channel, bandIndex), Foreground = (Brush)Application.Current.Resources["TextFillColorSecondaryBrush"] };
+        var typeCombo = new ComboBox { Width = 170, Tag = (channel, bandIndex), Foreground = (Brush)Application.Current.Resources["TextFillColorSecondaryBrush"] };
         int selectedTypeIndex = 0; // fall back to "Off" for stray crossover types
         for (int i = 0; i < typeItems.Count; i++)
         {
@@ -2092,6 +2054,7 @@ public sealed partial class MainWindow : Window
             // opens a flyout with all four (matching the macOS popover).
             var ltButton = BuildLinkwitzEditorButton(channel, bandIndex, p);
             ltButton.Opacity = p.Bypass ? 0.4 : 1.0;
+            ltButton.Margin = new Thickness(15, 0, 0, 0); // breathing room off the type combo
             Grid.SetColumn(ltButton, col);   // freq column
             Grid.SetColumnSpan(ltButton, 3); // span freq/Q/gain
             grid.Children.Add(ltButton);
@@ -2477,10 +2440,23 @@ public sealed partial class MainWindow : Window
     private static string FormatFilterValueSigned(float value) =>
         (value >= 0 ? "+" : "") + FormatFilterValue(value);
 
+    // Linkwitz Transform editor limits. f0/fp match the inline frequency field's
+    // range; Qp matches the wire clamp in FilterParams.QpEncoded.
+    private const float LtFreqMin = 20f, LtFreqMax = 20000f;
+    private const float LtQMin = 0.1f, LtQMax = 20f;
+
     /// <summary>A compact button that opens a flyout to edit the four Linkwitz
     /// Transform parameters (driver f0/Q0, target fp/Qp) plus a DC-boost readout.
     /// The four fields don't fit the three inline value columns, so they live in a
-    /// popover (matching the macOS reference).</summary>
+    /// popover (matching the macOS reference).
+    ///
+    /// The popover edits a *draft* and only pushes it to the device on Apply.
+    /// Committing per keystroke (as the inline fields do) was wrong here twice
+    /// over: SetFilter raises FiltersChanged, which rebuilds the channel editor
+    /// and so destroys the button hosting this flyout — the popover snapped shut
+    /// the moment you tabbed or clicked between fields — and a half-typed target
+    /// frequency would reach the speakers in the meantime, where LT's DC boost
+    /// can be tens of dB.</summary>
     private Button BuildLinkwitzEditorButton(Channel channel, int bandIndex, FilterParams p)
     {
         var button = new Button
@@ -2489,10 +2465,14 @@ public sealed partial class MainWindow : Window
             FontSize = 11,
             FontFamily = new FontFamily("Cascadia Code, Consolas"),
             Padding = new Thickness(8, 2, 8, 2),
-            HorizontalAlignment = HorizontalAlignment.Left
+            HorizontalAlignment = HorizontalAlignment.Left,
+            // Match the inline freq/Q/gain fields (InlineValueTextBoxStyle).
+            Foreground = (Brush)Application.Current.Resources["TextFillColorSecondaryBrush"]
         };
 
-        var content = new StackPanel { Spacing = 10, MinWidth = 260 };
+        var flyout = new Flyout();
+
+        var content = new StackPanel { Spacing = 10, MinWidth = 280 };
         content.Children.Add(new TextBlock
         {
             Text = "Linkwitz Transform",
@@ -2506,25 +2486,150 @@ public sealed partial class MainWindow : Window
             Foreground = (SolidColorBrush)Application.Current.Resources["TextFillColorSecondaryBrush"]
         });
 
-        content.Children.Add(LtRow("Driver",
-            CreateValueField("Hz", p.Frequency, 66, (channel, bandIndex, "freq")),
-            CreateValueField("Q0", p.Q, 56, (channel, bandIndex, "q"), decimals: 3)));
-        content.Children.Add(LtRow("Target",
-            CreateValueField("Hz", p.Gain, 66, (channel, bandIndex, "fp")),
-            CreateValueField("Qp", p.Qp, 56, (channel, bandIndex, "qp"), decimals: 3)));
+        var f0Box = LtValueBox(p.Frequency, 66, 0);
+        var q0Box = LtValueBox(p.Q, 56, 3);
+        var fpBox = LtValueBox(p.Gain, 66, 0);
+        var qpBox = LtValueBox(p.Qp, 56, 3);
 
-        double dcBoost = (p.Gain > 0 && p.Frequency > 0) ? 40.0 * Math.Log10(p.Frequency / p.Gain) : 0.0;
-        content.Children.Add(new TextBlock
+        content.Children.Add(LtRow("Driver", LtLabelled(f0Box, "Hz"), LtLabelled(q0Box, "Q0")));
+        content.Children.Add(LtRow("Target", LtLabelled(fpBox, "Hz"), LtLabelled(qpBox, "Qp")));
+
+        var statusText = new TextBlock { FontSize = 11, TextWrapping = TextWrapping.Wrap };
+        content.Children.Add(statusText);
+
+        var cancelButton = new Button { Content = "Cancel", MinWidth = 80 };
+        var applyButton = new Button
         {
-            Text = $"DC boost ≈ {dcBoost:+0.0;-0.0;0.0} dB",
-            FontSize = 11,
-            Foreground = new SolidColorBrush(dcBoost > 15
-                ? Color.FromArgb(255, 240, 180, 90)
-                : ((SolidColorBrush)Application.Current.Resources["TextFillColorSecondaryBrush"]).Color)
-        });
+            Content = "Apply",
+            MinWidth = 80,
+            Style = Application.Current.Resources.TryGetValue("AccentButtonStyle", out var accent)
+                ? accent as Style
+                : null
+        };
+        var buttonRow = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            Spacing = 8,
+            HorizontalAlignment = HorizontalAlignment.Right
+        };
+        buttonRow.Children.Add(cancelButton);
+        buttonRow.Children.Add(applyButton);
+        content.Children.Add(buttonRow);
 
-        button.Flyout = new Flyout { Content = content };
+        var warnBrush = new SolidColorBrush(Color.FromArgb(255, 240, 180, 90));
+        var secondaryBrush = (SolidColorBrush)Application.Current.Resources["TextFillColorSecondaryBrush"];
+
+        // Reads the draft out of the four boxes; false if anything is unparseable
+        // or out of range. Non-short-circuiting `&` so every out value is assigned.
+        bool TryReadDraft(out float f0, out float q0, out float fp, out float qp) =>
+            LtTryRead(f0Box, LtFreqMin, LtFreqMax, out f0)
+          & LtTryRead(q0Box, LtQMin, LtQMax, out q0)
+          & LtTryRead(fpBox, LtFreqMin, LtFreqMax, out fp)
+          & LtTryRead(qpBox, LtQMin, LtQMax, out qp);
+
+        void RefreshPreview()
+        {
+            bool valid = TryReadDraft(out float f0, out _, out float fp, out _);
+            applyButton.IsEnabled = valid;
+
+            if (!valid)
+            {
+                statusText.Text = $"f0 and fp: {LtFreqMin:F0}–{LtFreqMax:F0} Hz · Q0 and Qp: {LtQMin:0.#}–{LtQMax:0.#}";
+                statusText.Foreground = warnBrush;
+                return;
+            }
+
+            double dcBoost = 40.0 * Math.Log10(f0 / fp);
+            statusText.Text = $"DC boost ≈ {dcBoost:+0.0;-0.0;0.0} dB";
+            statusText.Foreground = secondaryBrush;
+        }
+
+        void Apply()
+        {
+            if (!TryReadDraft(out float f0, out float q0, out float fp, out float qp)) return;
+
+            var filters = ViewModel.GetFilters(channel);
+            if (bandIndex >= filters.Count) return;
+            var draft = filters[bandIndex].Clone();
+            draft.Frequency = f0;
+            draft.Q = q0;
+            draft.Gain = fp;   // LT carries the target frequency in the gain field
+            draft.Qp = qp;
+
+            // Hide first: SetFilter rebuilds the channel editor out from under
+            // this button, and dismissing an already-orphaned flyout throws.
+            flyout.Hide();
+            _ = ViewModel.SetFilter((int)channel.Id, bandIndex, draft);
+        }
+
+        foreach (var box in new[] { f0Box, q0Box, fpBox, qpBox })
+        {
+            box.TextChanged += (_, _) => RefreshPreview();
+            box.KeyDown += (_, e) =>
+            {
+                if (e.Key == Windows.System.VirtualKey.Enter)
+                {
+                    e.Handled = true;
+                    Apply();
+                }
+                else if (e.Key == Windows.System.VirtualKey.Escape)
+                {
+                    e.Handled = true;
+                    flyout.Hide();
+                }
+            };
+        }
+
+        cancelButton.Click += (_, _) => flyout.Hide();
+        applyButton.Click += (_, _) => Apply();
+
+        // Re-seed from the live filter each time it opens, so a discarded edit
+        // (Cancel or light dismiss) doesn't linger in the boxes.
+        flyout.Opening += (_, _) =>
+        {
+            var filters = ViewModel.GetFilters(channel);
+            if (bandIndex < filters.Count)
+            {
+                var cur = filters[bandIndex];
+                f0Box.Text = FormatFilterValue(cur.Frequency, 0);
+                q0Box.Text = FormatFilterValue(cur.Q, 3);
+                fpBox.Text = FormatFilterValue(cur.Gain, 0);
+                qpBox.Text = FormatFilterValue(cur.Qp, 3);
+            }
+            RefreshPreview();
+        };
+
+        RefreshPreview();
+        flyout.Content = content;
+        button.Flyout = flyout;
         return button;
+    }
+
+    private TextBox LtValueBox(float value, double width, int decimals) => new()
+    {
+        Width = width,
+        Text = FormatFilterValue(value, decimals),
+        FontSize = 13,
+        FontFamily = new FontFamily("Cascadia Code, Consolas"),
+        Style = (Style)RootGrid.Resources["InlineValueTextBoxStyle"]
+    };
+
+    private static bool LtTryRead(TextBox box, float min, float max, out float value) =>
+        float.TryParse(box.Text, NumberStyles.Float, CultureInfo.InvariantCulture, out value)
+        && value >= min && value <= max;
+
+    private static StackPanel LtLabelled(TextBox box, string label)
+    {
+        var panel = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 2 };
+        panel.Children.Add(box);
+        panel.Children.Add(new TextBlock
+        {
+            Text = label,
+            FontSize = 10,
+            Foreground = (SolidColorBrush)Application.Current.Resources["TextFillColorTertiaryBrush"],
+            VerticalAlignment = VerticalAlignment.Center
+        });
+        return panel;
     }
 
     private static Grid LtRow(string label, FrameworkElement a, FrameworkElement b)
@@ -2645,11 +2750,13 @@ public sealed partial class MainWindow : Window
                     break;
                 case nameof(MainViewModel.ActiveInputChannelCount):
                     // The number of USB input channels changed (Windows format /
-                    // input source) — rebuild the input rows and the graph legend.
+                    // input source) — rebuild the input rows, and the dashboard
+                    // with them since it carries one card per input pair.
                     if (ViewModel.IsDeviceConnected)
                     {
                         InitializeChannelLists();
-                        InitializeLegend();
+                        if (DashboardPanel.Visibility == Visibility.Visible)
+                            InitializeDashboard();
                     }
                     break;
                 case nameof(MainViewModel.ErrorMessage):
@@ -2710,7 +2817,6 @@ public sealed partial class MainWindow : Window
             _channelMeters.Clear();
 
             FadeCurves(0);
-            FadeElement(LegendPanel, 0);
 
             // Hide preset and source sections
             PresetSection.Visibility = Visibility.Collapsed;
@@ -2725,14 +2831,13 @@ public sealed partial class MainWindow : Window
             ChannelEditorPanel.Children.Clear();
             DashboardPanel.Visibility = Visibility.Visible;
             DashboardPanel.Children.Clear();
+            _dashboardCardTexts.Clear();
+            RebuildDashboardTextMaps();
         }
         else
         {
             InitializeChannelLists();
-            InitializeLegend();
-
             FadeCurves(1);
-            FadeElement(LegendPanel, 1);
         }
     }
 
@@ -3202,9 +3307,16 @@ public sealed partial class MainWindow : Window
         if (sender is not ListViewItem item || item.Tag is not (Channel channel, int index))
             return;
 
-        if (_selectedChannelIndex == index)
+        // A linked pair shares one editor page, so clicking either member of
+        // the currently shown pair counts as clicking the shown channel.
+        bool isShownPairPartner = _selectedChannel != null
+            && !_selectedChannel.IsOutput && !channel.IsOutput
+            && ViewModel.IsInputPairLinked((int)_selectedChannel.Id)
+            && ChannelMap.LinkedPartnerId((int)_selectedChannel.Id) == (int)channel.Id;
+
+        if (_selectedChannelIndex == index || isShownPairPartner)
         {
-            // Same channel clicked - go back to dashboard
+            // Same channel (or its linked partner) clicked - go back to dashboard
             _selectedChannelIndex = 0;
             UpdateChannelListSelection();
             ViewModel.UpdateChannelSelection(null);
@@ -3538,7 +3650,35 @@ public sealed partial class MainWindow : Window
                 if (bandIndex < filters.Count)
                 {
                     var p = filters[bandIndex].Clone();
+                    bool wasLt = p.Type.IsLinkwitzTransform();
+                    bool isLt = newType.IsLinkwitzTransform();
                     p.Type = newType;
+
+                    // LT overloads the wire fields — Gain carries fp in *Hz*, Q
+                    // carries the driver Q0 — so the values are not transferable
+                    // in either direction. Carrying an LT band's Gain into a
+                    // peaking band would turn a 30 Hz target into +30 dB of
+                    // boost; carrying a peaking band's Gain into LT would set a
+                    // negative or zero target frequency. Crossing the boundary
+                    // discards them.
+                    if (wasLt && !isLt)
+                    {
+                        // Back to a no-op band. f0 is a genuine frequency, so it
+                        // survives as the new band's centre.
+                        p.Gain = 0f;
+                        p.Q = FilterParams.DefaultQ;
+                        p.Qp = FilterParams.DefaultQp;
+                    }
+                    else if (isLt && !wasLt)
+                    {
+                        // Seed an identity transform (fp == f0, Qp == Q0): audibly
+                        // nothing until the user applies real driver/target values
+                        // in the popover.
+                        p.Q = FilterParams.DefaultQ;
+                        p.Qp = FilterParams.DefaultQ;
+                        p.Gain = p.Frequency;
+                    }
+
                     _ = ViewModel.SetFilter((int)channel.Id, bandIndex, p);
 
                     // Refresh the row (freq/Q/gain field visibility follows the type)
@@ -3597,12 +3737,8 @@ public sealed partial class MainWindow : Window
                         case "gain":
                             p.Gain = Math.Clamp(value, -20, 20);
                             break;
-                        case "fp":   // Linkwitz Transform target freq (Hz, carried in Gain)
-                            p.Gain = Math.Clamp(value, 10, 20000);
-                            break;
-                        case "qp":   // Linkwitz Transform target Q
-                            p.Qp = Math.Clamp(value, 0.1f, 20);
-                            break;
+                        // LT's fp/Qp are not edited inline — they live in the
+                        // Apply/Cancel popover (BuildLinkwitzEditorButton).
                     }
 
                     _ = ViewModel.SetFilter((int)channel.Id, bandIndex, p);
@@ -4339,6 +4475,10 @@ public sealed partial class MainWindow : Window
         // Preset). See output_config_independent_load_spec.md.
         SaveOutputConfigMenuItem.IsEnabled =
             ViewModel.IsDeviceConnected && ViewModel.OutputConfigMode == 0;
+        // A whole-device configuration is captured from, and pushed to, live
+        // device state — neither direction means anything while disconnected.
+        ImportPresetMenuItem.IsEnabled = ViewModel.IsDeviceConnected;
+        ExportPresetMenuItem.IsEnabled = ViewModel.IsDeviceConnected;
     }
 
     private async void OnSaveMasterVolumeClick(object sender, RoutedEventArgs e)
@@ -4584,6 +4724,21 @@ public sealed partial class MainWindow : Window
             _psybassWindow.Closed += (s, e) => _psybassWindow = null;
         }
         _psybassWindow.Activate();
+    }
+
+    private async void OnUpmixClick(object sender, RoutedEventArgs e)
+    {
+        // Refresh from the device so a value changed elsewhere (control surface,
+        // preset load) is reflected; the window shows an unsupported notice if absent.
+        if (ViewModel.IsDeviceConnected)
+            await Task.Run(() => ViewModel.FetchUpmix());
+
+        if (_upmixerWindow == null)
+        {
+            _upmixerWindow = new UpmixerWindow(ViewModel);
+            _upmixerWindow.Closed += (s, e) => _upmixerWindow = null;
+        }
+        _upmixerWindow.Activate();
     }
 
     private async void OnMatrixMixerClick(object sender, RoutedEventArgs e)
@@ -5038,7 +5193,8 @@ public sealed partial class MainWindow : Window
     private async Task ImportSingleChannelFilters(List<FilterParams> filters)
     {
         var dialog = new ChannelSelectionDialog { XamlRoot = Content.XamlRoot };
-        dialog.ConfigureForSingleChannel(filters.Count, ViewModel.ActiveOutputs, ViewModel.IsOutputEnabled);
+        dialog.ConfigureForSingleChannel(filters.Count, ViewModel.ActiveInputs, ViewModel.ActiveOutputs,
+            ViewModel.IsOutputEnabled, ch => ViewModel.GetChannelName(ch));
 
         var result = await dialog.ShowAsync();
         if (result == ContentDialogResult.Primary)
@@ -5064,54 +5220,89 @@ public sealed partial class MainWindow : Window
         Dictionary<int, List<FilterParams>> channelFilters,
         Dictionary<int, List<FilterParams>>? channelXover = null)
     {
+        // Every channel the file mentions, PEQ or crossover.
+        var inFile = new HashSet<int>(channelFilters.Keys);
+        if (channelXover != null)
+            inFile.UnionWith(channelXover.Keys);
+
+        // Channels the file carries that this device can't take (e.g. an
+        // 8-input export opened against a stereo device). Called out explicitly
+        // rather than dropped, which is what used to happen.
+        var selectable = new HashSet<int>(
+            ViewModel.ActiveInputs.Select(c => (int)c.Id)
+                .Concat(ViewModel.ActiveOutputs.Select(c => (int)c.Id)));
+        var unavailable = inFile.Where(id => !selectable.Contains(id)).ToList();
+
         var dialog = new ChannelSelectionDialog { XamlRoot = Content.XamlRoot };
-        dialog.ConfigureForMultiChannel(channelFilters.Keys, ViewModel.ActiveOutputs, ViewModel.IsOutputEnabled);
+        dialog.ConfigureForMultiChannel(inFile, ViewModel.ActiveInputs, ViewModel.ActiveOutputs,
+            ViewModel.IsOutputEnabled, ch => ViewModel.GetChannelName(ch));
 
         var result = await dialog.ShowAsync();
-        if (result == ContentDialogResult.Primary)
-        {
-            dialog.CollectSelectedChannels();
-            foreach (var channelId in dialog.SelectedChannelIds)
-            {
-                if (channelFilters.TryGetValue(channelId, out var filters))
-                {
-                    List<FilterParams>? xover = null;
-                    channelXover?.TryGetValue(channelId, out xover);
-                    if (!await ApplyFiltersToChannel(channelId, filters, xover))
-                    {
-                        await ShowErrorDialog("Communication Failure - Unable to perform operation");
-                        return;
-                    }
-                }
-            }
+        if (result != ContentDialogResult.Primary) return;
 
-            if (dialog.SelectedChannelIds.Count > 0)
+        dialog.CollectSelectedChannels();
+        int applied = 0;
+        foreach (var channelId in dialog.SelectedChannelIds)
+        {
+            channelFilters.TryGetValue(channelId, out var filters);
+            List<FilterParams>? xover = null;
+            channelXover?.TryGetValue(channelId, out xover);
+
+            // A channel selected but absent from the file has nothing to apply —
+            // skip it rather than counting it as imported.
+            if (filters == null && xover == null) continue;
+
+            if (!await ApplyFiltersToChannel(channelId, filters, xover))
             {
-                await ShowSuccessDialog("Filters imported successfully");
+                await ShowErrorDialog("Communication Failure - Unable to perform operation");
+                return;
             }
+            applied++;
         }
+
+        var skipped = string.Join(", ", unavailable
+            .Select(id => Channel.All.FirstOrDefault(c => (int)c.Id == id)?.Name ?? $"channel {id}"));
+
+        if (applied == 0)
+        {
+            var message = unavailable.Count > 0
+                ? $"No filters imported. The file's channels are not available on this device: {skipped}."
+                : "No filters imported — none of the selected channels are present in the file.";
+            await ShowErrorDialog(message);
+            return;
+        }
+
+        var summary = $"Filters imported to {applied} channel(s)";
+        if (unavailable.Count > 0)
+            summary += $"\n\nNot imported (not available on this device): {skipped}";
+        await ShowSuccessDialog(summary);
     }
 
     private async Task<bool> ApplyFiltersToChannel(
-        int channelId, List<FilterParams> filters, List<FilterParams>? xover = null)
+        int channelId, List<FilterParams>? filters, List<FilterParams>? xover = null)
     {
         var channel = Channel.All.FirstOrDefault(c => (int)c.Id == channelId);
         if (channel == null) return false;
 
         var bandCount = channel.BandCount;
 
-        // Apply imported filters
-        for (int i = 0; i < Math.Min(filters.Count, bandCount); i++)
+        // A null list means the file carried no PEQ section for this channel
+        // (crossover only) — leave the channel's existing EQ alone.
+        if (filters != null)
         {
-            if (!await SetFilterWithRetry(channelId, i, filters[i].Clone()))
-                return false;
-        }
+            // Apply imported filters
+            for (int i = 0; i < Math.Min(filters.Count, bandCount); i++)
+            {
+                if (!await SetFilterWithRetry(channelId, i, filters[i].Clone()))
+                    return false;
+            }
 
-        // Clear remaining bands
-        for (int i = filters.Count; i < bandCount; i++)
-        {
-            if (!await SetFilterWithRetry(channelId, i, new FilterParams(FilterType.Flat, 1000, 0.707f, 0)))
-                return false;
+            // Clear remaining bands
+            for (int i = filters.Count; i < bandCount; i++)
+            {
+                if (!await SetFilterWithRetry(channelId, i, new FilterParams(FilterType.Flat, 1000, 0.707f, 0)))
+                    return false;
+            }
         }
 
         // Crossover bands — only when the file specified them for this channel and
@@ -5195,6 +5386,258 @@ public sealed partial class MainWindow : Window
         }
     }
 
+    // ── Whole-device configuration (.dspipreset) ──
+
+    private async void OnExportPresetClick(object sender, RoutedEventArgs e)
+    {
+        if (!ViewModel.IsDeviceConnected)
+        {
+            await ShowErrorDialog("Not connected to device");
+            return;
+        }
+
+        var picker = new FileSavePicker();
+        picker.SuggestedStartLocation = PickerLocationId.DocumentsLibrary;
+        picker.SuggestedFileName = "DSPi Preset";
+        picker.FileTypeChoices.Add("DSPi Preset File",
+            new List<string> { PresetFileService.FileExtension });
+
+        var hwnd = WindowNative.GetWindowHandle(this);
+        InitializeWithWindow.Initialize(picker, hwnd);
+
+        var file = await picker.PickSaveFileAsync();
+        if (file == null) return;
+
+        try
+        {
+            var doc = PresetFileService.Capture(
+                ViewModel, System.IO.Path.GetFileNameWithoutExtension(file.Name));
+
+            // Firmware version is only available from the device, and the fetch
+            // is a blocking control transfer — keep it off the UI thread and
+            // treat a failure as "unknown" rather than failing the export.
+            var info = await Task.Run(() => ViewModel.Device.GetDeviceInfo());
+            if (info.HasValue)
+            {
+                doc.Meta.FirmwareVersion = info.Value.FirmwareVersion;
+                if (!string.IsNullOrWhiteSpace(info.Value.Platform))
+                    doc.Meta.Platform = info.Value.Platform;
+            }
+
+            await Windows.Storage.FileIO.WriteTextAsync(file, PresetFileService.Serialize(doc));
+
+            int bands = doc.Channels.Sum(c => c.Eq.Count(b => b.Type != 0));
+            int xover = doc.Channels.Sum(c => c.Crossover.Count(b => b.Type != 0));
+            await ShowSuccessDialog(
+                $"Preset file exported.\n\n" +
+                $"{doc.Channels.Count} channels, {bands} active EQ bands, " +
+                $"{xover} crossover bands, {doc.Matrix.Count} crosspoints.");
+        }
+        catch (Exception ex)
+        {
+            await ShowErrorDialog($"Failed to write file: {ex.Message}");
+        }
+    }
+
+    private async void OnImportPresetClick(object sender, RoutedEventArgs e)
+    {
+        if (!ViewModel.IsDeviceConnected)
+        {
+            await ShowErrorDialog("Not connected to device");
+            return;
+        }
+
+        var picker = new FileOpenPicker();
+        picker.SuggestedStartLocation = PickerLocationId.DocumentsLibrary;
+        picker.FileTypeFilter.Add(PresetFileService.FileExtension);
+        picker.FileTypeFilter.Add(".json");
+
+        var hwnd = WindowNative.GetWindowHandle(this);
+        InitializeWithWindow.Initialize(picker, hwnd);
+
+        var file = await picker.PickSingleFileAsync();
+        if (file == null) return;
+
+        PresetDocument doc;
+        try
+        {
+            var json = await Windows.Storage.FileIO.ReadTextAsync(file);
+            doc = PresetFileService.Deserialize(json);
+        }
+        catch (Exception ex)
+        {
+            await ShowErrorDialog($"Failed to read file: {ex.Message}");
+            return;
+        }
+
+        var options = await AskPresetImportOptions(doc);
+        if (options == null) return;
+
+        // The apply issues hundreds of control transfers; unplugging the device
+        // partway through surfaces as a USB exception. Catch it here — this is
+        // an async void handler, so an escaping exception takes the app down,
+        // and the device is left half-configured either way.
+        PresetApplyReport report;
+        try
+        {
+            report = await ApplyPresetWithProgress(doc, options);
+        }
+        catch (Exception ex)
+        {
+            await ShowErrorDialog(
+                $"The import stopped partway through: {ex.Message}\n\n" +
+                "The device now holds a mix of its previous settings and the imported ones. " +
+                "Reconnect and import again, or load a stored preset to get back to a known state.");
+            return;
+        }
+
+        await ShowPresetImportResult(report);
+    }
+
+    /// <summary>
+    /// Ask what to bring in. Audio processing is the point of the file so it is
+    /// fixed on; volume and physical wiring are opt-in, since neither
+    /// necessarily belongs to the machine the file is being applied to.
+    /// </summary>
+    private async Task<PresetApplyOptions?> AskPresetImportOptions(PresetDocument doc)
+    {
+        var volumeCheck = new CheckBox { Content = "Volume levels (master / listening volume)" };
+        var ioCheck = new CheckBox { Content = "Hardware I/O configuration (GPIO pins, clocks, ADAT, inputs)" };
+
+        var panel = new StackPanel { Spacing = 8 };
+
+        var provenance = new List<string>();
+        if (!string.IsNullOrWhiteSpace(doc.Meta.Platform)) provenance.Add(doc.Meta.Platform!);
+        if (!string.IsNullOrWhiteSpace(doc.Meta.FirmwareVersion)) provenance.Add($"firmware {doc.Meta.FirmwareVersion}");
+        if (doc.Meta.SavedUtc != default) provenance.Add(doc.Meta.SavedUtc.ToLocalTime().ToString("yyyy-MM-dd HH:mm"));
+
+        panel.Children.Add(new TextBlock
+        {
+            TextWrapping = TextWrapping.Wrap,
+            Text = provenance.Count > 0
+                ? $"Saved from {string.Join(", ", provenance)}."
+                : "Applies the settings in this file to the connected device.",
+        });
+
+        // A document from a device with a different channel count still applies;
+        // say so up front rather than burying it in the result. Only when both
+        // platforms are actually known — MainViewModel.Platform is "" until the
+        // device reports in, and "" is not a mismatch worth warning about.
+        var sourcePlatform = doc.Meta.Platform;
+        if (!string.IsNullOrWhiteSpace(sourcePlatform) &&
+            !string.IsNullOrWhiteSpace(ViewModel.Platform) &&
+            !string.Equals(sourcePlatform, ViewModel.Platform, StringComparison.OrdinalIgnoreCase))
+        {
+            panel.Children.Add(new TextBlock
+            {
+                TextWrapping = TextWrapping.Wrap,
+                Text = $"This file came from a {sourcePlatform} device and you are connected to " +
+                       $"{ViewModel.Platform}. Anything the connected device doesn't have " +
+                       $"will be skipped.",
+                Foreground = (SolidColorBrush)Application.Current.Resources["TextFillColorSecondaryBrush"],
+            });
+        }
+
+        panel.Children.Add(new TextBlock
+        {
+            Text = "EQ, crossover, delays, gains, routing and the DSP features are always applied.",
+            TextWrapping = TextWrapping.Wrap,
+            Foreground = (SolidColorBrush)Application.Current.Resources["TextFillColorSecondaryBrush"],
+        });
+        panel.Children.Add(volumeCheck);
+        panel.Children.Add(ioCheck);
+
+        var dialog = new ContentDialog
+        {
+            Title = "Import Preset File",
+            Content = panel,
+            PrimaryButtonText = "Import",
+            CloseButtonText = "Cancel",
+            DefaultButton = ContentDialogButton.Primary,
+            XamlRoot = Content.XamlRoot,
+        };
+
+        if (await dialog.ShowAsync() != ContentDialogResult.Primary) return null;
+
+        return new PresetApplyOptions
+        {
+            AudioProcessing = true,
+            VolumeLevels = volumeCheck.IsChecked == true,
+            HardwareIo = ioCheck.IsChecked == true,
+        };
+    }
+
+    /// <summary>
+    /// Run the import behind a modal progress dialog. Applying a full document
+    /// is several hundred control transfers, so the window would otherwise sit
+    /// unresponsive-looking for a few seconds with the device half-configured.
+    /// </summary>
+    private async Task<PresetApplyReport> ApplyPresetWithProgress(
+        PresetDocument doc, PresetApplyOptions options)
+    {
+        var bar = new ProgressBar { Minimum = 0, Maximum = 1, Value = 0, Width = 280 };
+        var progressDialog = new ContentDialog
+        {
+            Title = "Importing Preset File",
+            Content = new StackPanel
+            {
+                Spacing = 12,
+                Children =
+                {
+                    new TextBlock { Text = "Writing settings to the device..." },
+                    bar,
+                },
+            },
+            XamlRoot = Content.XamlRoot,
+        };
+
+        var progress = new Progress<double>(v => bar.Value = v);
+        var showTask = progressDialog.ShowAsync();
+
+        PresetApplyReport report;
+        try
+        {
+            report = await PresetFileService.ApplyAsync(doc, ViewModel, options, progress);
+        }
+        finally
+        {
+            progressDialog.Hide();
+            try { await showTask; } catch { }
+        }
+
+        return report;
+    }
+
+    private async Task ShowPresetImportResult(PresetApplyReport report)
+    {
+        var lines = new List<string>
+        {
+            $"Applied {report.ChannelsApplied} channels, {report.BandsApplied} EQ bands, " +
+            $"{report.CrossoverBandsApplied} crossover bands, {report.CrosspointsApplied} crosspoints.",
+        };
+
+        if (report.MissingChannels.Count > 0)
+            lines.Add($"Not present on this device: {string.Join(", ", report.MissingChannels)}");
+
+        foreach (var skipped in report.Skipped)
+            lines.Add($"Skipped: {skipped}");
+
+        // Everything landed in RAM. Saying so avoids the trap of power-cycling
+        // and losing the whole import. "Preset slot" rather than "preset", to
+        // keep it distinct from the file that was just imported.
+        lines.Add("These changes are live but not yet stored on the device. " +
+                  "Save them to a preset slot to keep them.");
+
+        // Anything the device refused or couldn't do isn't a success, so don't
+        // put a "Success" heading over it.
+        bool clean = report.MissingChannels.Count == 0 && report.Skipped.Count == 0;
+        var text = string.Join("\n\n", lines);
+        if (clean)
+            await ShowSuccessDialog(text);
+        else
+            await ShowInfoDialog(text);
+    }
+
     #endregion
 
     #region AutoEQ Handlers
@@ -5237,6 +5680,7 @@ public sealed partial class MainWindow : Window
         var dialog = new ChannelSelectionDialog { XamlRoot = Content.XamlRoot };
         dialog.ConfigureForAutoEQ(
             filters.Count,
+            ViewModel.ActiveInputs,
             ViewModel.ActiveOutputs,
             ViewModel.IsOutputEnabled,
             ch => ViewModel.GetChannelName(ch));
@@ -5422,7 +5866,6 @@ public sealed partial class MainWindow : Window
 
         // Animate graph row collapsing
         GraphGripperControl.Visibility = Visibility.Collapsed;
-        LegendPanel.Visibility = Visibility.Collapsed;
         AnimateGraphRow(GraphRow.Height.Value, 0, 250, () =>
         {
             GraphArea.Visibility = Visibility.Collapsed;
@@ -5442,15 +5885,12 @@ public sealed partial class MainWindow : Window
             // Restore and animate graph row expanding
             GraphArea.Visibility = Visibility.Visible;
             GraphArea.Opacity = 0;
-            LegendPanel.Visibility = Visibility.Visible;
-            LegendPanel.Opacity = 0;
             GraphRow.Height = new GridLength(0);
 
             AnimateGraphRow(0, 250, 300, () =>
             {
                 GraphGripperControl.Visibility = Visibility.Visible;
                 GraphArea.Opacity = 1;
-                LegendPanel.Opacity = 1;
             });
         };
         _graphWindow.Activate();
@@ -5472,10 +5912,9 @@ public sealed partial class MainWindow : Window
             double height = from + (to - from) * eased;
             GraphRow.Height = new GridLength(Math.Max(0, height));
 
-            // Fade graph area and legend proportionally
+            // Fade the graph area proportionally
             double opacity = to > from ? eased : 1.0 - eased;
             GraphArea.Opacity = opacity;
-            LegendPanel.Opacity = opacity;
 
             if (t >= 1.0)
             {

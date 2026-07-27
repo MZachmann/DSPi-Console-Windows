@@ -65,6 +65,11 @@ public sealed partial class ControlSurfacesWindow : Window
     // Per-slot pin-combo refreshers: re-run a slot's GPIO pickers in place (e.g.
     // after another slot claims a pin) without recreating the card body.
     private readonly Dictionary<int, List<Action>> _pinRefreshers = new();
+    // Per-slot / per-sub channel-picker relabellers, re-run when the user renames a
+    // channel in the sidebar (the combo keeps its items and selection; only the
+    // displayed names change).
+    private readonly Dictionary<int, Action> _channelRelabel = new();
+    private readonly Dictionary<int, Action> _irChannelRelabel = new();
 
     // Live handles to the IR receiver's command section, so IR edits can rebuild
     // just that section in place instead of tearing down the whole cards panel
@@ -114,6 +119,7 @@ public sealed partial class ControlSurfacesWindow : Window
 
         _vm.PropertyChanged += OnVmPropertyChanged;
         _vm.ControlSurfacesReloaded += OnReloaded;
+        _vm.ChannelNameChanged += OnChannelNameChanged;
         Closed += OnClosed;
 
         SeedDrafts();
@@ -124,8 +130,14 @@ public sealed partial class ControlSurfacesWindow : Window
     {
         _vm.PropertyChanged -= OnVmPropertyChanged;
         _vm.ControlSurfacesReloaded -= OnReloaded;
+        _vm.ChannelNameChanged -= OnChannelNameChanged;
         if (_appWindow != null) _appWindow.Changed -= OnAppWindowChanged;
     }
+
+    /// <summary>A channel was renamed (sidebar edit, preset load, or a device
+    /// push) — relabel everything here that shows a channel name.</summary>
+    private void OnChannelNameChanged(int channelId) =>
+        DispatcherQueue.TryEnqueue(RefreshChannelLabels);
 
     /// <summary>Snap the width back to <see cref="FixedWidth"/> if a resize (edge
     /// drag, snap layout, …) changed it; height is left alone.</summary>
@@ -214,6 +226,7 @@ public sealed partial class ControlSurfacesWindow : Window
             _slotBodies.Clear();
             _slotCards.Clear();
             _pinRefreshers.Clear();
+            _channelRelabel.Clear();
 
             int shown = 0;
             for (int slot = 0; slot < _vm.CsSlotCount; slot++)
@@ -380,7 +393,10 @@ public sealed partial class ControlSurfacesWindow : Window
         try
         {
             panel.Children.Clear();
-            _pinRefreshers.Remove(slot); // pickers below re-register fresh closures
+            // Pickers below re-register fresh closures; a noun without a channel
+            // target simply won't put one back.
+            _pinRefreshers.Remove(slot);
+            _channelRelabel.Remove(slot);
             var draft = _drafts[slot];
 
             panel.Children.Add(BuildIdentityRows(slot));
@@ -494,6 +510,7 @@ public sealed partial class ControlSurfacesWindow : Window
         var chCombo = new ComboBox { MinWidth = 180 };
         for (int i = 0; i < nd.TargetCount; i++)
             chCombo.Items.Add(new ComboBoxItem { Content = ChannelLabel(nd.TargetKind, i), Tag = i });
+        _channelRelabel[slot] = () => Relabel(chCombo, nd.TargetKind);
         chCombo.SelectedIndex = draft.Target < nd.TargetCount ? draft.Target : 0;
         chCombo.SelectionChanged += (_, _) =>
         {
@@ -662,12 +679,12 @@ public sealed partial class ControlSurfacesWindow : Window
         var draft = _drafts[slot];
         if (nd.Kind == CsKind.Enum || nd.Unit == CsUnit.None)
         {
-            var box = NumberField(draft.Step == 0 ? 1 : CsWire.DecodeStep(draft.Step, nd.Unit), CsUnit.None, v =>
+            var box = NumberField(draft.Step == 0 ? CsWire.DefaultStep(nd.Unit) : CsWire.DecodeStep(draft.Step, nd.Unit), CsUnit.None, v =>
             { _drafts[slot].Step = CsWire.EncodeStep(v, nd.Unit); RefreshStatusIndicators(); });
             return Row("Step (positions)", box);
         }
-        // Hz/Q step is in octaves; dB/% linear.
-        string label = nd.Unit is CsUnit.Hz or CsUnit.Q ? "Step (octaves)" : $"Step ({CsWire.UnitSymbol(nd.Unit)})";
+        // Hz/Q step is in octaves; dB/%/ms linear.
+        string label = nd.Unit is CsUnit.Hz or CsUnit.Q ? "Step (octaves)" : StepLabel(nd.Unit);
         var stepBox = NumberField(CsWire.DecodeStep(draft.Step, nd.Unit), CsUnit.None, v =>
         { _drafts[slot].Step = CsWire.EncodeStep(v, nd.Unit); RefreshStatusIndicators(); });
         return Row(label, stepBox);
@@ -694,7 +711,7 @@ public sealed partial class ControlSurfacesWindow : Window
         {
             var combo = new ComboBox { MinWidth = 120 };
             for (int i = 0; i < Math.Max(1, (int)nd.EnumCount); i++)
-                combo.Items.Add(new ComboBoxItem { Content = i.ToString(CultureInfo.InvariantCulture), Tag = (short)i });
+                combo.Items.Add(new ComboBoxItem { Content = CsNounInfo.EnumLabel(draft.Noun, i), Tag = (short)i });
             combo.SelectedIndex = Math.Clamp((int)draft.Value, 0, Math.Max(0, nd.EnumCount - 1));
             combo.SelectionChanged += (_, _) =>
             {
@@ -706,7 +723,7 @@ public sealed partial class ControlSurfacesWindow : Window
         }
         var box = NumberField(CsWire.DecodeValue(draft.Value, nd.Unit), nd.Unit, v =>
         { _drafts[slot].Value = CsWire.EncodeValue(v, nd.Unit); RefreshStatusIndicators(); });
-        return Row($"Value ({CsWire.UnitSymbol(nd.Unit)})", box);
+        return Row(ValueLabel(nd.Unit), box);
     }
 
     private FrameworkElement BuildFlagRows(int slot, CsNounDesc nd)
@@ -790,6 +807,7 @@ public sealed partial class ControlSurfacesWindow : Window
             _irCommandCards.Clear();
             _irLearnButtons.Clear();
             _irTitles.Clear();
+            _irChannelRelabel.Clear();
             bool receiverLive = _vm.CsStatus?.IsSlotActive(slot) == true;
 
             _irCountLabel = new TextBlock { Text = IrCountText(), FontWeight = FontWeights.SemiBold };
@@ -862,6 +880,7 @@ public sealed partial class ControlSurfacesWindow : Window
         _irCommandCards.Remove(sub);
         _irLearnButtons.Remove(sub);
         _irTitles.Remove(sub);
+        _irChannelRelabel.Remove(sub);
     }
 
     /// <summary>Rebuild a single remote-button card in place (chip, learn state,
@@ -1049,6 +1068,7 @@ public sealed partial class ControlSurfacesWindow : Window
         var chCombo = new ComboBox { MinWidth = 160 };
         for (int i = 0; i < nd.TargetCount; i++)
             chCombo.Items.Add(new ComboBoxItem { Content = ChannelLabel(nd.TargetKind, i), Tag = i });
+        _irChannelRelabel[sub] = () => Relabel(chCombo, nd.TargetKind);
         chCombo.SelectedIndex = draft.Target < nd.TargetCount ? draft.Target : 0;
         chCombo.SelectionChanged += (_, _) =>
         {
@@ -1087,7 +1107,7 @@ public sealed partial class ControlSurfacesWindow : Window
         if (action is CsAction.Inc or CsAction.Dec)
         {
             string label = nd.Unit is CsUnit.Hz or CsUnit.Q ? "Step (octaves)"
-                : nd.Unit == CsUnit.None ? "Step (positions)" : $"Step ({CsWire.UnitSymbol(nd.Unit)})";
+                : nd.Unit == CsUnit.None ? "Step (positions)" : StepLabel(nd.Unit);
             var box = NumberField(CsWire.DecodeStep(draft.Step, nd.Unit), CsUnit.None, v =>
                 _irDrafts[sub].Step = CsWire.EncodeStep(v, nd.Unit));
             return Row(label, box);
@@ -1107,9 +1127,22 @@ public sealed partial class ControlSurfacesWindow : Window
                 };
                 return Row("Value", combo);
             }
+            if (nd.Kind == CsKind.Enum)
+            {
+                var combo = new ComboBox { MinWidth = 120 };
+                for (int i = 0; i < Math.Max(1, (int)nd.EnumCount); i++)
+                    combo.Items.Add(new ComboBoxItem { Content = CsNounInfo.EnumLabel(draft.Noun, i), Tag = (short)i });
+                combo.SelectedIndex = Math.Clamp((int)draft.Value, 0, Math.Max(0, nd.EnumCount - 1));
+                combo.SelectionChanged += (_, _) =>
+                {
+                    if (_building) return;
+                    if (combo.SelectedItem is ComboBoxItem it && it.Tag is short v) _irDrafts[sub].Value = v;
+                };
+                return Row("Value", combo);
+            }
             var box = NumberField(CsWire.DecodeValue(draft.Value, nd.Unit), nd.Unit, v =>
                 _irDrafts[sub].Value = CsWire.EncodeValue(v, nd.Unit));
-            return Row($"Value ({CsWire.UnitSymbol(nd.Unit)})", box);
+            return Row(ValueLabel(nd.Unit), box);
         }
         return null; // Toggle / Trigger
     }
@@ -1210,6 +1243,7 @@ public sealed partial class ControlSurfacesWindow : Window
         _slotSummaries.Remove(slot);
         _slotApply.Remove(slot);
         _pinRefreshers.Remove(slot);
+        _channelRelabel.Remove(slot);
         _expanded.Remove(slot);
         if (slot == _irSectionSlot)
         {
@@ -1221,6 +1255,7 @@ public sealed partial class ControlSurfacesWindow : Window
             _irCommandCards.Clear();
             _irLearnButtons.Clear();
             _irTitles.Clear();
+            _irChannelRelabel.Clear();
         }
         if (CardsPanel.Children.Count == 0) EmptyHint.Visibility = Visibility.Visible;
     }
@@ -1651,6 +1686,21 @@ public sealed partial class ControlSurfacesWindow : Window
         return g;
     }
 
+    /// <summary>"Value (dB)" / "Value (ms)" …, or a bare "Value" for a unitless
+    /// noun (or one whose unit this build doesn't know).</summary>
+    private static string ValueLabel(CsUnit unit)
+    {
+        string sym = CsWire.UnitSymbol(unit);
+        return sym.Length > 0 ? $"Value ({sym})" : "Value";
+    }
+
+    /// <summary>"Step (dB)" / "Step (ms)" …, bare "Step" for an unknown unit.</summary>
+    private static string StepLabel(CsUnit unit)
+    {
+        string sym = CsWire.UnitSymbol(unit);
+        return sym.Length > 0 ? $"Step ({sym})" : "Step";
+    }
+
     /// <summary>A numeric text field that parses on Enter / focus loss and calls
     /// back with the parsed value. Unit is used only for display formatting.</summary>
     private static TextBox NumberField(double value, CsUnit unit, Action<double> onChanged)
@@ -1788,10 +1838,27 @@ public sealed partial class ControlSurfacesWindow : Window
         _ => a.ToString(),
     };
 
-    private string ChannelLabel(CsTarget kind, int i) => kind switch
+    /// <summary>Channel target label: the user-editable sidebar name, kept in sync
+    /// by <see cref="RefreshChannelLabels"/> while this window is open.</summary>
+    private string ChannelLabel(CsTarget kind, int i) => _vm.CsTargetLabel(kind, i);
+
+    /// <summary>Rewrite a channel picker's item captions in place. Items and the
+    /// current selection are untouched, so no SelectionChanged handler fires.</summary>
+    private void Relabel(ComboBox combo, CsTarget kind)
     {
-        CsTarget.InputCh => $"Input {i + 1}",
-        CsTarget.OutputCh => $"Output {i + 1}",
-        _ => $"Channel {i + 1}",
-    };
+        foreach (var o in combo.Items)
+            if (o is ComboBoxItem item && item.Tag is int i)
+                item.Content = ChannelLabel(kind, i);
+    }
+
+    /// <summary>Re-read every channel name shown in this window after a sidebar
+    /// rename: the target pickers, the IR command titles, and the card summaries
+    /// (refreshed by <see cref="RefreshStatusIndicators"/>).</summary>
+    private void RefreshChannelLabels()
+    {
+        foreach (var relabel in _channelRelabel.Values) relabel();
+        foreach (var relabel in _irChannelRelabel.Values) relabel();
+        foreach (int sub in _irTitles.Keys) UpdateIrTitle(sub);
+        RefreshStatusIndicators();
+    }
 }

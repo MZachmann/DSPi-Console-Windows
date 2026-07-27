@@ -29,6 +29,14 @@ public static class VendorCommands
     public const byte GetChannelGain = 0x55;
     public const byte SetChannelMute = 0x56;
     public const byte GetChannelMute = 0x57;
+    // Stereo upmixer (wire V26, RP2350 only; upmixer_spec.md). On RP2040 the
+    // SETs STALL and the GETs return all-zero payloads.
+    public const byte UpmixSetConfig = 0x4A; // OUT, 44-byte UpmixConfigPacket
+    public const byte UpmixGetConfig = 0x4B; // IN, 44 bytes
+    public const byte UpmixSetParam  = 0x4C; // OUT, wValue=param id (0-13), 4-byte float
+    public const byte UpmixGetParam  = 0x4D; // IN, wValue=param id, 4-byte float
+    public const byte UpmixGetStatus = 0x4E; // IN, 16-byte UpmixStatus
+
     public const byte SetLoudnessEnabled = 0x58;
     public const byte GetLoudnessEnabled = 0x59;
     public const byte SetLoudnessRefSPL = 0x5A;
@@ -2371,6 +2379,40 @@ public partial class DspDevice : ObservableObject, IDisposable
         System.Threading.Thread.Sleep(250);
         var st = GetCtrlIfaceStatus();
         return st?.I2cLastStatus ?? (byte)0xFF;
+    }
+
+    // ── Stereo upmixer (0x4A–0x4E, RP2350 only) ──────────────────────────────
+
+    /// <summary>Apply a whole upmix config atomically (0x4A, 44 bytes).</summary>
+    public bool SetUpmixConfig(UpmixConfig cfg) =>
+        ControlTransferOut(VendorCommands.UpmixSetConfig, 0, cfg.ToBytes());
+
+    /// <summary>Read the applied upmix config (0x4B). Null on STALL/failure;
+    /// on RP2040 the read succeeds but every field is zero.</summary>
+    public UpmixConfig? GetUpmixConfig()
+    {
+        var r = ControlTransferIn(VendorCommands.UpmixGetConfig, 0, UpmixConfig.WireSize);
+        return r == null ? null : UpmixConfig.FromBytes(r);
+    }
+
+    /// <summary>Set one upmix param (0x4C). Everything travels as a float,
+    /// including enable and the mode params. Preferred for live sliders (no
+    /// read-modify-write race against other controllers).</summary>
+    public bool SetUpmixParam(ushort paramId, float value) =>
+        ControlTransferOut(VendorCommands.UpmixSetParam, paramId, BitConverter.GetBytes(value));
+
+    /// <summary>Read one upmix param as a float (0x4D).</summary>
+    public float? GetUpmixParam(ushort paramId)
+    {
+        var r = ControlTransferIn(VendorCommands.UpmixGetParam, paramId, 4);
+        return r != null && r.Length >= 4 ? BitConverter.ToSingle(r, 0) : (float?)null;
+    }
+
+    /// <summary>Read live upmixer telemetry (0x4E, 16 bytes). Poll at 5-20 Hz.</summary>
+    public UpmixStatus? GetUpmixStatus()
+    {
+        var r = ControlTransferIn(VendorCommands.UpmixGetStatus, 0, UpmixStatus.WireSize);
+        return r == null ? null : UpmixStatus.FromBytes(r);
     }
 
     // ── Psychoacoustic bass (0x30–0x3D) ──────────────────────────────────────

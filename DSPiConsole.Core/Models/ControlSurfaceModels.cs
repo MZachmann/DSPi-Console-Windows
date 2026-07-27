@@ -3,7 +3,7 @@ using System;
 namespace DSPiConsole.Core.Models;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Control Surfaces + IR remote (firmware control_surfaces.h; caps v3, config v2,
+// Control Surfaces + IR remote (firmware control_surfaces.h; caps v4, config v2,
 // IR config v1). Physical GPIO controls (buttons, switches, pots, encoders, LEDs,
 // PWM LEDs) and an IR receiver with learned remote commands, each bound to a DSP
 // "noun" (parameter) + "action" (verb). All wire structs are packed, little-endian.
@@ -23,7 +23,7 @@ public enum CsType : byte
     Led = 5, LedPwm = 6, Ir = 7
 }
 
-/// <summary>DSP parameter a control drives or reflects (firmware CsNoun, 0..34).
+/// <summary>DSP parameter a control drives or reflects (firmware CsNoun, 0..48).
 /// The picker reads which nouns are available (and their ranges/units/targets)
 /// live from caps — this enum is for the few places that special-case a noun.</summary>
 public enum CsNoun : byte
@@ -35,7 +35,13 @@ public enum CsNoun : byte
     OutputMute = 18, OutputEnable = 19, FilterFreq = 20, FilterGain = 21,
     FilterQ = 22, FilterType = 23, FilterBypass = 24, Siggen = 25,
     DacMuteTest = 26, ClipCh = 27, Level = 28, SpdifLock = 29, SampleRate = 30,
-    UsbStreaming = 31, AdatActive = 32, LgPresent = 33, LgMuted = 34
+    UsbStreaming = 31, AdatActive = 32, LgPresent = 33, LgMuted = 34,
+    // caps v4 additions. The six upmixer nouns are RP2350-only (action mask 0
+    // on RP2040, the same convention as AdatActive).
+    Upmix = 35, UpmixCenterMode = 36, UpmixSurroundMode = 37, UpmixStrength = 38,
+    UpmixWidth = 39, UpmixPresence = 40, Psybass = 41, PsybassCutoff = 42,
+    PsybassHarmonics = 43, PsybassDrive = 44, PsybassCharacter = 45,
+    PsybassOriginal = 46, OutputDelay = 47, PresetReload = 48
 }
 
 /// <summary>Verb a control performs (firmware CsAction). Value = bit position;
@@ -75,8 +81,9 @@ public enum CsFlags : byte
 public enum CsKind : byte { Continuous = 0, Bool = 1, Enum = 2 }
 
 /// <summary>Noun unit; fixes the wire encoding of value/range/step and the
-/// stepping law (firmware CS_UNIT_*).</summary>
-public enum CsUnit : byte { None = 0, Db = 1, Hz = 2, Q = 3, Percent = 4 }
+/// stepping law (firmware CS_UNIT_*). <c>Ms</c> is a caps-v4 addition (8.8
+/// milliseconds, linear, default step 0.1 ms) used by OutputDelay.</summary>
+public enum CsUnit : byte { None = 0, Db = 1, Hz = 2, Q = 3, Percent = 4, Ms = 5 }
 
 /// <summary>What a noun's <c>target</c> addresses (firmware CS_TARGET_*).</summary>
 public enum CsTarget : byte
@@ -176,10 +183,10 @@ public static class CsWire
 {
     /// <summary>Units whose value/range are 8.8 signed fixed point (1.0 = 256).</summary>
     public static bool UnitIsFixedPoint(CsUnit u) =>
-        u is CsUnit.Db or CsUnit.Q or CsUnit.Percent;
+        u is CsUnit.Db or CsUnit.Q or CsUnit.Percent or CsUnit.Ms;
 
-    /// <summary>Encode a value/range operand for a noun's unit. DB/Q/PERCENT use
-    /// 8.8; NONE and HZ are plain integers.</summary>
+    /// <summary>Encode a value/range operand for a noun's unit. DB/Q/PERCENT/MS
+    /// use 8.8; NONE and HZ are plain integers.</summary>
     public static short EncodeValue(double v, CsUnit u) =>
         (short)Math.Round(UnitIsFixedPoint(u) ? v * 256.0 : v);
 
@@ -187,8 +194,8 @@ public static class CsWire
         UnitIsFixedPoint(u) ? raw / 256.0 : raw;
 
     /// <summary>Encode a step operand. Everything except NONE is scaled ×256 —
-    /// for HZ/Q the value is in octaves (256 = 1 octave); for DB/PERCENT it is a
-    /// linear dB/% step. NONE (bool/enum) is a plain position count.</summary>
+    /// for HZ/Q the value is in octaves (256 = 1 octave); for DB/PERCENT/MS it is
+    /// a linear dB/%/ms step. NONE (bool/enum) is a plain position count.</summary>
     public static short EncodeStep(double v, CsUnit u) =>
         (short)Math.Round(u == CsUnit.None ? v : v * 256.0);
 
@@ -201,7 +208,18 @@ public static class CsWire
         CsUnit.Hz => "Hz",
         CsUnit.Q => "Q",
         CsUnit.Percent => "%",
+        CsUnit.Ms => "ms",
         _ => ""
+    };
+
+    /// <summary>The step the firmware applies when a binding leaves <c>step</c>
+    /// at 0, in the unit's own terms (octaves for the log units). Display only.</summary>
+    public static double DefaultStep(CsUnit u) => u switch
+    {
+        CsUnit.Hz or CsUnit.Q => 1.0 / 12.0,  // 1/12 octave
+        CsUnit.Ms => 0.1,                     // caps v4: ms detents are finer
+        CsUnit.None => 1,                     // one enum position
+        _ => 1                                // 1 dB / 1 %
     };
 
     public static string IrProtocolName(CsIrProto p) => p switch
@@ -214,7 +232,7 @@ public static class CsWire
     };
 }
 
-/// <summary>Client-side display metadata for the 35 nouns (the wire format
+/// <summary>Client-side display metadata for the 49 nouns (the wire format
 /// carries no strings). Kept minimal — the picker still reads availability,
 /// ranges, units and targets from caps.</summary>
 public static class CsNounInfo
@@ -228,8 +246,61 @@ public static class CsNounInfo
         "Output Mute", "Output Enable", "Filter Frequency", "Filter Gain",
         "Filter Q", "Filter Type", "Filter Bypass", "Signal Generator",
         "DAC Mute Test", "Clip (Channel)", "Level", "S/PDIF Lock", "Sample Rate",
-        "USB Streaming", "ADAT Active", "LG Present", "LG Muted"
+        "USB Streaming", "ADAT Active", "LG Present", "LG Muted",
+        // caps v4
+        "Stereo Upmixer", "Upmix Centre Mode", "Upmix Surround Mode",
+        "Upmix Strength", "Upmix Centre Width", "Upmix Centre Presence",
+        "Psychoacoustic Bass", "Bass Cutoff Frequency", "Bass Harmonics",
+        "Bass Drive", "Bass Character", "Original Bass Level",
+        "Output Delay", "Reload Preset"
     };
+
+    // Value labels for the enum-kind nouns. The picker only uses as many entries
+    // as the noun's caps enum_count reports, and falls back to the bare index for
+    // anything past the end, so a firmware that grows an enum still works.
+    private static readonly string[] PresetNames =
+        { "Preset 1", "Preset 2", "Preset 3", "Preset 4", "Preset 5",
+          "Preset 6", "Preset 7", "Preset 8", "Preset 9", "Preset 10" };
+
+    private static readonly string[] InputSourceNames =
+        { "USB", "S/PDIF", "I2S", "ADAT", "S/PDIF 2", "S/PDIF 3" };
+
+    private static readonly string[] CrossfeedPresetNames =
+        { "Default", "Chu Moy", "Jan Meier", "Custom" };
+
+    private static readonly string[] LevellerSpeedNames = { "Slow", "Medium", "Fast" };
+
+    private static readonly string[] FilterTypeNames =
+        { "Flat", "Peaking", "Low Shelf", "High Shelf", "Low Pass", "High Pass",
+          "Notch", "All Pass", "All Pass (1st)", "Low Shelf (1st)",
+          "High Shelf (1st)", "Linkwitz Transform" };
+
+    private static readonly string[] SampleRateNames = { "44.1 kHz", "48 kHz", "96 kHz" };
+
+    // Wire 0/1 and 0/1/2; the app shows the upmixer's product mode names.
+    private static readonly string[] UpmixCenterModeNames = { "Sinner", "Logician" };
+    private static readonly string[] UpmixSurroundModeNames = { "Off", "Sinner", "Logician" };
+
+    /// <summary>Label for one value of an enum-kind noun, e.g. "S/PDIF" for
+    /// InputSource 1. Falls back to the plain index for unknown nouns/values.</summary>
+    public static string EnumLabel(int noun, int value)
+    {
+        var table = (CsNoun)noun switch
+        {
+            CsNoun.Preset => PresetNames,
+            CsNoun.InputSource => InputSourceNames,
+            CsNoun.CrossfeedPreset => CrossfeedPresetNames,
+            CsNoun.LevellerSpeed => LevellerSpeedNames,
+            CsNoun.FilterType => FilterTypeNames,
+            CsNoun.SampleRate => SampleRateNames,
+            CsNoun.UpmixCenterMode => UpmixCenterModeNames,
+            CsNoun.UpmixSurroundMode => UpmixSurroundModeNames,
+            _ => null
+        };
+        return table != null && value >= 0 && value < table.Length
+            ? table[value]
+            : value.ToString(System.Globalization.CultureInfo.InvariantCulture);
+    }
 
     public static string Name(int noun) =>
         noun >= 0 && noun < Names.Length ? Names[noun] : $"Noun {noun}";
@@ -244,11 +315,18 @@ public static class CsNounInfo
         CsNoun.Loudness or CsNoun.Crossfeed or CsNoun.Leveller or CsNoun.EqBypass
             or CsNoun.CrossfeedPreset or CsNoun.CrossfeedItd or CsNoun.LevellerAmount
             or CsNoun.LevellerSpeed or CsNoun.LevellerLookahead => "DSP",
-        CsNoun.OutputGain or CsNoun.OutputMute or CsNoun.OutputEnable => "Output",
+        CsNoun.Upmix or CsNoun.UpmixCenterMode or CsNoun.UpmixSurroundMode
+            or CsNoun.UpmixStrength or CsNoun.UpmixWidth or CsNoun.UpmixPresence => "Upmixer",
+        CsNoun.Psybass or CsNoun.PsybassCutoff or CsNoun.PsybassHarmonics
+            or CsNoun.PsybassDrive or CsNoun.PsybassCharacter
+            or CsNoun.PsybassOriginal => "Psychoacoustic Bass",
+        CsNoun.OutputGain or CsNoun.OutputMute or CsNoun.OutputEnable
+            or CsNoun.OutputDelay => "Output",
         CsNoun.FilterFreq or CsNoun.FilterGain or CsNoun.FilterQ or CsNoun.FilterType
             or CsNoun.FilterBypass => "Filter",
         CsNoun.Preset or CsNoun.InputSource or CsNoun.Siggen or CsNoun.DacMuteTest
-            or CsNoun.SampleRate or CsNoun.UsbStreaming or CsNoun.AdatActive => "System",
+            or CsNoun.SampleRate or CsNoun.UsbStreaming or CsNoun.AdatActive
+            or CsNoun.PresetReload => "System",
         CsNoun.LgSync or CsNoun.LgPresent or CsNoun.LgMuted or CsNoun.SpdifLock => "LG / S/PDIF",
         CsNoun.Clip or CsNoun.ClipCh => "Status",
         _ => "Other"

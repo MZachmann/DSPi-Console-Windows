@@ -47,6 +47,18 @@ public sealed class SiggenConfig
     public const float LevelMinDb = -120f;
     public const float LevelMaxDb = 0f;
 
+    /// <summary>Level used when the device hands back an unconfigured (zeroed) config.
+    /// A zeroed struct means 0 dBFS, so never adopt it as the draft's starting level.</summary>
+    public const float DefaultLevelDb = -20f;
+
+    /// <summary>Sweep length used when a sweep type has no duration yet. The firmware
+    /// rejects SET_CONFIG for a sweep with duration_ms == 0.</summary>
+    public const uint DefaultSweepMs = 1000;
+
+    /// <summary>Per-channel dwell used for a walked continuous signal when none is set
+    /// (matches the firmware's own 2 s fallback in compute_derived).</summary>
+    public const uint DefaultWalkDwellMs = 2000;
+
     public SiggenType SignalType = SiggenType.Sine;
     public ushort ChannelMask;
     public ushort InvertMask;
@@ -80,9 +92,15 @@ public sealed class SiggenConfig
         return b;
     }
 
+    /// <summary>True when the device has never staged a config: SET_CONFIG rejects an
+    /// empty channel mask, so a zero mask can only come from the firmware's zeroed
+    /// "no config applied" response.</summary>
+    public bool IsUnconfigured => ChannelMask == 0;
+
     public static SiggenConfig? FromBytes(byte[] d)
     {
         if (d == null || d.Length < WireSize) return null;
+        if (d[0] != Version) return null;   // unknown struct version: don't misparse
         return new SiggenConfig
         {
             SignalType = (SiggenType)d[1],
@@ -135,6 +153,7 @@ public sealed class SiggenStatus
     public static SiggenStatus? FromBytes(byte[] d)
     {
         if (d == null || d.Length < WireSize) return null;
+        if (d[0] != SiggenConfig.Version) return null;
         return new SiggenStatus
         {
             State = (SiggenState)d[1],
@@ -193,6 +212,63 @@ public sealed class SiggenTypeDesc
         }
         return desc;
     }
+
+    /// <summary>True when the generator steps through the masked channels one at a time.
+    /// CHANNEL_ID always walks, whatever the WALK flag says.</summary>
+    public bool WalksWith(SiggenFlags flags) =>
+        Id == SiggenType.ChannelId || flags.HasFlag(SiggenFlags.Walk);
+
+    /// <summary>
+    /// Bring a draft's p1..p4 in line with this type: unused slots go to 0, and a slot
+    /// that is NaN or outside the advertised range takes the descriptor default. Params
+    /// carry over when the type changes, and the firmware silently substitutes its own
+    /// fallbacks for out-of-range values, so seeding here keeps what the UI shows equal
+    /// to what actually plays.
+    /// </summary>
+    public void SeedParams(SiggenConfig cfg)
+    {
+        for (int i = 0; i < Params.Length; i++)
+        {
+            var p = Params[i];
+            if (!p.IsUsed) { cfg.SetParam(i, 0f); continue; }
+            float v = cfg.GetParam(i);
+            if (float.IsNaN(v) || v < p.Min || v > p.Max) v = p.Default;
+            cfg.SetParam(i, v);
+        }
+    }
+
+    /// <summary>
+    /// Bring duration/repeat/gap in line with this type's timing model, zeroing the
+    /// fields the model ignores so a stale value from a previously selected type cannot
+    /// leak into the wire config (e.g. a pattern's gap silently spacing out sweeps).
+    /// </summary>
+    public void SeedTiming(SiggenConfig cfg, SiggenFlags flags)
+    {
+        switch (TimingModel)
+        {
+            case SiggenTimingModel.Sweep:
+                // duration_ms = one sweep and must be > 0 or SET_CONFIG is rejected.
+                if (cfg.DurationMs == 0) cfg.DurationMs = SiggenConfig.DefaultSweepMs;
+                break;
+
+            case SiggenTimingModel.Pattern:
+                cfg.DurationMs = 0;   // unused
+                break;
+
+            default:  // Continuous
+                if (WalksWith(flags))
+                {
+                    // duration_ms becomes the per-channel dwell; repeat counts passes.
+                    if (cfg.DurationMs == 0) cfg.DurationMs = SiggenConfig.DefaultWalkDwellMs;
+                }
+                else
+                {
+                    cfg.Repeat = 0;   // unused
+                }
+                cfg.GapMs = 0;        // unused either way
+                break;
+        }
+    }
 }
 
 /// <summary>The 8-byte SiggenCapsHeader (REQ_SIGGEN_GET_CAPS, wValue 0xFFFF).</summary>
@@ -204,9 +280,17 @@ public sealed class SiggenCaps
     public byte MultitoneMax;     // 16 RP2350 / 8 RP2040
     public ushort ValidChannelMask;
 
+    /// <summary>Output bits the firmware accepts, falling back to OutputChannels when the
+    /// header reports no mask.</summary>
+    public ushort UsableChannelMask =>
+        ValidChannelMask != 0 ? ValidChannelMask
+        : OutputChannels >= 16 ? (ushort)0xFFFF
+        : (ushort)((1 << OutputChannels) - 1);
+
     public static SiggenCaps? FromBytes(byte[] d)
     {
         if (d == null || d.Length < WireSize) return null;
+        if (d[0] != SiggenConfig.Version) return null;
         return new SiggenCaps
         {
             TypeCount = d[1],

@@ -172,6 +172,12 @@ public class BulkParams
     public float PsybassCharacterPct;  // 0..100
     public float PsybassOriginalDb;    // -60..0
     public bool HasPsybass;
+
+    // ── Stereo upmixer (offset 5900, 44 bytes) — appended V25+, presence V26 ──
+    // Byte-identical to the 0x4A/0x4B UpmixConfigPacket. On RP2040 the section
+    // is present but zero.
+    public UpmixConfig? Upmix;
+    public bool HasUpmix;
 }
 
 /// <summary>
@@ -194,8 +200,9 @@ public static class BulkParamsParser
 
     public const int PacketSizeV20 = 5876;       // sizeof(WireBulkParams) at V20
     public const int PacketSizeV24 = 5900;       // sizeof(WireBulkParams) at V24 (+psybass)
+    public const int PacketSizeV26 = 5944;       // sizeof(WireBulkParams) at V25/V26 (+upmix)
     public const byte MinFormatVersion = 16;     // unified channel model floor
-    public const byte CurrentFormatVersion = 24;
+    public const byte CurrentFormatVersion = 26;
 
     // Raw wire value of FILTER_LINKWITZ_TRANSFORM (FilterType.LinkwitzTransform).
     // Referenced by value here so band decoding is independent of the Core enum.
@@ -225,6 +232,7 @@ public static class BulkParamsParser
     public const int OffsetCrossover = 4780;    // 1088 (17 × 4 × 16)
     public const int OffsetAdat = 5868;         // 8
     public const int OffsetPsybass = 5876;       // 24 (appended V23+)
+    public const int OffsetUpmix = 5900;        // 44 (appended V25+; presence byte V26)
 
     public static BulkParams? Parse(byte[] buffer)
     {
@@ -449,6 +457,13 @@ public static class BulkParamsParser
             p.PsybassDriveDb = BitConverter.ToSingle(buffer, OffsetPsybass + 12);
             p.PsybassCharacterPct = BitConverter.ToSingle(buffer, OffsetPsybass + 16);
             p.PsybassOriginalDb = BitConverter.ToSingle(buffer, OffsetPsybass + 20);
+        }
+
+        // ── Stereo upmixer (44 bytes, appended V25+; presence byte claimed V26) ──
+        if (buffer.Length >= PacketSizeV26)
+        {
+            p.Upmix = UpmixConfig.FromBytes(buffer, OffsetUpmix);
+            p.HasUpmix = p.Upmix != null;
         }
 
         return p;

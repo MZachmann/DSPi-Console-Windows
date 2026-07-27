@@ -19,19 +19,21 @@ public sealed partial class ChannelSelectionDialog : ContentDialog
     /// <summary>
     /// Configure for single-channel import (REW format) - applies to any channel.
     /// </summary>
-    public void ConfigureForSingleChannel(int filterCount, IReadOnlyList<Channel> activeOutputs,
-        Func<int, bool> isOutputEnabled)
+    public void ConfigureForSingleChannel(int filterCount, IReadOnlyList<Channel> activeInputs,
+        IReadOnlyList<Channel> activeOutputs, Func<int, bool> isOutputEnabled,
+        Func<Channel, string> getChannelName)
     {
         Title = "Import Filters";
         MessageText.Text = $"Found {filterCount} filter(s). Select which channel(s) to apply them to:";
 
-        // Master channels — checked by default
-        foreach (var channel in new[] { Channel.MasterLeft, Channel.MasterRight })
-            AddCheckbox(channel, isChecked: true);
+        // Input channels — the base stereo pair is checked by default; the
+        // extra multichannel inputs (RP2350) are offered but left unchecked.
+        for (int i = 0; i < activeInputs.Count; i++)
+            AddCheckbox(activeInputs[i], isChecked: i < 2, getChannelName(activeInputs[i]));
 
         // All output channels — unchecked
         for (int o = 0; o < activeOutputs.Count; o++)
-            AddCheckbox(activeOutputs[o], isChecked: false);
+            AddCheckbox(activeOutputs[o], isChecked: false, getChannelName(activeOutputs[o]));
     }
 
     /// <summary>
@@ -39,34 +41,50 @@ public sealed partial class ChannelSelectionDialog : ContentDialog
     /// pre-checks enabled ones that are present in the file.
     /// </summary>
     public void ConfigureForMultiChannel(IEnumerable<int> availableChannelIds,
-        IReadOnlyList<Channel> activeOutputs, Func<int, bool> isOutputEnabled)
+        IReadOnlyList<Channel> activeInputs, IReadOnlyList<Channel> activeOutputs,
+        Func<int, bool> isOutputEnabled, Func<Channel, string> getChannelName)
     {
         Title = "Import Filters";
         MessageText.Text = "This file contains filter settings for multiple channels. Select which channels to import:";
         var inFile = new HashSet<int>(availableChannelIds);
 
-        // Master channels — checked if present in file
-        foreach (var channel in new[] { Channel.MasterLeft, Channel.MasterRight })
-            AddCheckbox(channel, isChecked: inFile.Contains((int)channel.Id));
+        // Input channels — checked if present in file
+        foreach (var channel in activeInputs)
+            AddCheckbox(channel, isChecked: inFile.Contains((int)channel.Id), getChannelName(channel));
 
         // All output channels — checked if present in file AND enabled
         for (int o = 0; o < activeOutputs.Count; o++)
-            AddCheckbox(activeOutputs[o], isChecked: inFile.Contains((int)activeOutputs[o].Id) && isOutputEnabled(o));
+            AddCheckbox(activeOutputs[o],
+                isChecked: inFile.Contains((int)activeOutputs[o].Id) && isOutputEnabled(o),
+                getChannelName(activeOutputs[o]));
     }
 
     /// <summary>
     /// Configure for AutoEQ profile application - groups channels by stereo pairs with custom names.
     /// </summary>
-    public void ConfigureForAutoEQ(int filterCount, IReadOnlyList<Channel> activeOutputs,
-        Func<int, bool> isOutputEnabled, Func<Channel, string> getChannelName)
+    public void ConfigureForAutoEQ(int filterCount, IReadOnlyList<Channel> activeInputs,
+        IReadOnlyList<Channel> activeOutputs, Func<int, bool> isOutputEnabled,
+        Func<Channel, string> getChannelName)
     {
         Title = "Apply AutoEQ Profile";
         PrimaryButtonText = "Apply";
         MessageText.Text = $"Select which channel(s) to apply {filterCount} filter(s) to:";
 
-        // Inputs group
+        // Inputs group — paired up like the outputs. Only the first pair is
+        // checked by default; an AutoEQ curve targets one listening path.
         AddGroupHeader("Inputs");
-        AddStereoCheckbox(Channel.MasterLeft, Channel.MasterRight, getChannelName, isChecked: true);
+        for (int i = 0; i < activeInputs.Count; i++)
+        {
+            if (i + 1 < activeInputs.Count)
+            {
+                AddStereoCheckbox(activeInputs[i], activeInputs[i + 1], getChannelName, isChecked: i == 0);
+                i++; // skip partner
+            }
+            else
+            {
+                AddCheckbox(activeInputs[i], isChecked: i == 0, getChannelName(activeInputs[i]));
+            }
+        }
 
         // Outputs group
         AddGroupHeader("Outputs");

@@ -81,5 +81,9 @@ public partial class MainViewModel
     {
         OnPropertyChanged(nameof(ActiveInputChannelCount));
         OnPropertyChanged(nameof(ActiveInputs));
+        // The upmixer only runs on a stereo input, so the derived matrix rows
+        // (C/Ls/Rs) appear and vanish with the active input set.
+        OnPropertyChanged(nameof(UpmixRowsActive));
+        OnPropertyChanged(nameof(UpmixSurroundRowsActive));
     }
 }

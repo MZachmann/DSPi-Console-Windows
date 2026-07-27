@@ -44,7 +44,11 @@ public partial class MainViewModel
                 case 0x08: Task.Run(() => { var s = _device.GetAdatStatus(); if (s != null) _dispatcher.TryEnqueue(() => OnPropertyChanged(nameof(AdatEnabled))); FetchAdatConfig(); }); break;
                 case 0x09: Task.Run(RefreshI2sSlaveStatus); break;
                 case 0x0B: Task.Run(RefreshAdatInputStatus); break;
-                // 0x07 siggen: the Test Signals window polls its own status.
+                // Siggen start/stop/completion/reconfigure. The Test Signals window
+                // also polls while it believes the generator is running, but the push
+                // is what catches a stop nothing is watching for (Identify finishing,
+                // preset load, duration exhausted with the window closed).
+                case 0x07: RefreshSiggenStatus(); break;
             }
         };
     }
@@ -59,6 +63,10 @@ public partial class MainViewModel
         { Task.Run(FetchLoudness); return; }
         if (off >= BulkParamsParser.OffsetCrossfeed && off < BulkParamsParser.OffsetLegacy)
         { Task.Run(FetchCrossfeed); return; }
+        // Upmix section sits above psybass in the struct — match it first, or the
+        // open-ended psybass range would swallow upmix offsets.
+        if (off >= BulkParamsParser.OffsetUpmix)
+        { Task.Run(FetchUpmix); return; }
         if (off >= BulkParamsParser.OffsetPsybass)
         { Task.Run(FetchPsybass); return; }
         if (off >= BulkParamsParser.OffsetDacHwMute && off < BulkParamsParser.OffsetCrossover)

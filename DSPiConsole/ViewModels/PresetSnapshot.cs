@@ -108,6 +108,10 @@ public class PresetSnapshot
     // (0xE6/0xE7) when the toggle moves and is honored on bulk SET.
     public bool LgSoundSyncEnabled;
 
+    // Stereo upmixer (slot V34): all 14 fields round-trip with the preset.
+    // Null when the firmware has no upmixer (pre-V25 / RP2040).
+    public UpmixConfig? Upmix;
+
     /// <summary>
     /// Capture a snapshot from the current ViewModel state.
     /// </summary>
@@ -236,6 +240,10 @@ public class PresetSnapshot
         // LG Sound Sync enable flag (V8+ preset slot field)
         snap.LgSoundSyncEnabled = vm.LgSoundSyncEnabled;
 
+        // Stereo upmixer (slot V34)
+        if (vm.UpmixSupported)
+            snap.Upmix = vm.CaptureUpmixConfig();
+
         return snap;
     }
 
@@ -353,6 +361,36 @@ public static class PresetDiff
             changes.Add($"Leveller detector: {MaskList(old.LevellerDetectorMask)} → {MaskList(cur.LevellerDetectorMask)}");
         if (old.LevellerApplyMask != cur.LevellerApplyMask)
             changes.Add($"Leveller apply: {MaskList(old.LevellerApplyMask)} → {MaskList(cur.LevellerApplyMask)}");
+
+        // Stereo upmixer
+        if (old.Upmix != null && cur.Upmix != null)
+        {
+            var (ou, cu) = (old.Upmix, cur.Upmix);
+            if (ou.Enabled != cu.Enabled)
+                changes.Add($"Upmixer: {(cu.Enabled ? "enabled" : "disabled")}");
+            // Product mode names: PASSIVE = Sinner, ADAPTIVE = Logician.
+            string ModeC(byte m) => m == 0 ? "Sinner" : "Logician";
+            string ModeS(byte m) => m == 0 ? "Off" : m == 1 ? "Sinner" : "Logician";
+            if (ou.CenterMode != cu.CenterMode)
+                changes.Add($"Upmixer centre mode: {ModeC(ou.CenterMode)} → {ModeC(cu.CenterMode)}");
+            if (ou.SurroundMode != cu.SurroundMode)
+                changes.Add($"Upmixer surround mode: {ModeS(ou.SurroundMode)} → {ModeS(cu.SurroundMode)}");
+            int upmixParamChanges = 0;
+            void CmpF(float a, float b) { if (Math.Abs(a - b) > 0.05f) upmixParamChanges++; }
+            CmpF(ou.StrengthPct, cu.StrengthPct);
+            CmpF(ou.CenterWidthPct, cu.CenterWidthPct);
+            CmpF(ou.CorrThresholdPct, cu.CorrThresholdPct);
+            CmpF(ou.AttackMs, cu.AttackMs);
+            CmpF(ou.ReleaseMs, cu.ReleaseMs);
+            CmpF(ou.DetectorHpfHz, cu.DetectorHpfHz);
+            CmpF(ou.SurroundDelayMs, cu.SurroundDelayMs);
+            CmpF(ou.SurroundHpfHz, cu.SurroundHpfHz);
+            CmpF(ou.SurroundLpfHz, cu.SurroundLpfHz);
+            CmpF(ou.DecorrPct, cu.DecorrPct);
+            CmpF(ou.PresenceDb, cu.PresenceDb);
+            if (upmixParamChanges > 0)
+                changes.Add($"{upmixParamChanges} upmixer parameter{(upmixParamChanges == 1 ? "" : "s")} changed");
+        }
 
         // Channel delays
         foreach (var ch in Channel.All)

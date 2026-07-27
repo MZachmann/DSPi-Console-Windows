@@ -9,6 +9,7 @@ using Microsoft.UI.Dispatching;
 using Microsoft.UI.Windowing;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
+using Microsoft.UI.Xaml.Input;
 using WinRT.Interop;
 
 namespace DSPiConsole;
@@ -32,6 +33,7 @@ public sealed partial class TestSignalsWindow : Window
     private bool _running;
     private MaskChipGrid? _channelGrid;
     private readonly DispatcherQueueTimer _pollTimer;
+    private readonly DispatcherQueueTimer _applyTimer;
 
     public TestSignalsWindow(MainViewModel viewModel)
     {
@@ -64,6 +66,16 @@ public sealed partial class TestSignalsWindow : Window
         _pollTimer = DispatcherQueue.CreateTimer();
         _pollTimer.Interval = TimeSpan.FromMilliseconds(600);
         _pollTimer.Tick += (_, _) => _ = _viewModel.PollSiggenStatusAsync();
+
+        // SET_CONFIG while running makes the firmware fade out, swap and fade back in,
+        // so coalesce edits (slider drags, spinner clicks) into one restart.
+        _applyTimer = DispatcherQueue.CreateTimer();
+        _applyTimer.Interval = TimeSpan.FromMilliseconds(200);
+        _applyTimer.IsRepeating = false;
+        _applyTimer.Tick += (_, _) =>
+        {
+            if (_running && _config.ChannelMask != 0) _ = _viewModel.ApplySiggenConfigAsync();
+        };
 
         _viewModel.PropertyChanged += OnViewModelPropertyChanged;
         Closed += OnClosed;
@@ -105,6 +117,13 @@ public sealed partial class TestSignalsWindow : Window
         for (int i = 0; i < items.Count; i++)
             if (items[i].Desc.Id == _config.SignalType) { sel = i; break; }
         TypeGrid.SelectedIndex = items.Count > 0 ? sel : -1;
+
+        if (items.Count > 0)
+        {
+            // Keep the draft on the type the grid actually highlights.
+            _config.SignalType = items[sel].Desc.Id;
+            ApplyTypeConstraints(items[sel].Desc);
+        }
 
         _isUpdating = false;
 
@@ -164,16 +183,20 @@ public sealed partial class TestSignalsWindow : Window
 
         _channelGrid = new MaskChipGrid(
             MaskChipGrid.AllBits(count),
-            bit => bit < outputs.Count ? outputs[bit].Name : $"Output {bit + 1}",
+            bit => (bit < outputs.Count ? outputs[bit].Name : $"Output {bit + 1}")
+                   + " — right-click to invert polarity",
             OnChannelToggle,
             stretch: true,
-            captionForBit: bit => bit < outputs.Count && outputs[bit].ShortName == "PDM" ? "S" : null);
+            captionForBit: bit => bit < outputs.Count && outputs[bit].ShortName == "PDM" ? "S" : null,
+            onSecondaryToggle: OnChannelInvertToggle);
 
         ChannelHost.Children.Clear();
         ChannelHost.Children.Add(_channelGrid.Root);
         _channelGrid.SetMask(_config.ChannelMask);
+        _channelGrid.SetSecondaryMask(_config.InvertMask);
 
-        int all = count >= 16 ? 0xFFFF : (1 << count) - 1;
+        int all = _viewModel.SiggenCaps?.UsableChannelMask
+                  ?? (count >= 16 ? 0xFFFF : (1 << count) - 1);
         var flyout = new MenuFlyout();
         void AddPreset(string text, int mask)
         {
@@ -194,19 +217,73 @@ public sealed partial class TestSignalsWindow : Window
         SetChannelMask((ushort)mask);
     }
 
-    private void SetChannelMask(ushort mask)
+    /// <summary>Right-click on a selected channel flips its polarity for the generated
+    /// signal (SiggenConfig.invert_mask, which the firmware clamps to channel_mask).</summary>
+    private void OnChannelInvertToggle(int index)
     {
-        _config.ChannelMask = mask;
-        _channelGrid?.SetMask(mask);
+        _config.InvertMask ^= (ushort)(1 << index);
+        _config.InvertMask &= _config.ChannelMask;
+        _channelGrid?.SetSecondaryMask(_config.InvertMask);
         ApplyIfRunning();
     }
 
+    private void SetChannelMask(ushort mask)
+    {
+        _config.ChannelMask = mask;
+        _config.InvertMask &= mask;   // deselecting a channel drops its invert bit
+        _channelGrid?.SetMask(mask);
+        _channelGrid?.SetSecondaryMask(_config.InvertMask);
+
+        if (mask == 0)
+        {
+            // The firmware rejects an empty channel mask, so there is nothing to send.
+            // Stop rather than leaving the generator running on channels the UI has
+            // already deselected.
+            _applyTimer.Stop();
+            if (_running) { _ = _viewModel.StopSiggenAsync(); return; }
+        }
+
+        if (_running) ApplyIfRunning();
+        else UpdateStatus(_viewModel.SiggenStatus);   // refresh the empty-mask hint
+    }
+
     // ── Per-type parameters + timing ──
+
+    /// <summary>Flags the firmware ignores (or forces) for this type, reflected in the
+    /// checkboxes and cleared from the draft so the wire config matches what is shown.</summary>
+    private void ApplyTypeConstraints(SiggenTypeDesc desc)
+    {
+        bool wasUpdating = _isUpdating;
+        _isUpdating = true;
+
+        bool noise = desc.Id is SiggenType.White or SiggenType.Pink;
+        DecorrToggle.IsEnabled = noise;
+        ToolTipService.SetToolTip(DecorrToggle,
+            noise ? null : "Applies to white and pink noise only.");
+        if (!noise) _config.Flags &= ~SiggenFlags.Decorrelate;
+        DecorrToggle.IsChecked = _config.Flags.HasFlag(SiggenFlags.Decorrelate);
+
+        // Channel ID always walks, whatever the flag says.
+        bool forcedWalk = desc.Id == SiggenType.ChannelId;
+        WalkToggle.IsEnabled = !forcedWalk;
+        ToolTipService.SetToolTip(WalkToggle,
+            forcedWalk ? "Channel ID always walks the selected outputs." : null);
+        if (forcedWalk) _config.Flags |= SiggenFlags.Walk;
+        WalkToggle.IsChecked = _config.Flags.HasFlag(SiggenFlags.Walk);
+
+        _isUpdating = wasUpdating;
+    }
 
     private void BuildTypeSpecific(SiggenTypeDesc desc)
     {
         ParamHost.Children.Clear();
         TimingHost.Children.Clear();
+
+        // Params and timing fields carry over when the type changes, and the firmware
+        // silently substitutes its own fallbacks for zero/out-of-range values. Seed the
+        // draft from the descriptor first so the rows show what will actually play.
+        desc.SeedParams(_config);
+        desc.SeedTiming(_config, _config.Flags);
 
         // Disambiguate repeated semantics ("Frequency 1", "Frequency 2").
         var semCounts = new Dictionary<SiggenParamSemantic, int>();
@@ -231,27 +308,40 @@ public sealed partial class TestSignalsWindow : Window
                 v => { _config.SetParam(idx, (float)v); ApplyIfRunning(); });
         }
 
-        // Timing rows depend on the type's timing model.
+        // Timing rows depend on the type's timing model — and, for continuous types,
+        // on WALK: it turns duration_ms into a per-channel dwell and brings repeat
+        // (passes over the mask) into play.
         switch (desc.TimingModel)
         {
+            case SiggenTimingModel.Continuous when desc.WalksWith(_config.Flags):
+                AddNumberRow(TimingHost, "Dwell per channel", "ms",
+                    _config.DurationMs, 100, 600000, 100,
+                    v => { _config.DurationMs = (uint)Math.Max(100, v); ApplyIfRunning(); });
+                AddNumberRow(TimingHost, "Passes", "over the selected outputs (0 = until stopped)",
+                    _config.Repeat, 0, 9999, 1,
+                    v => { _config.Repeat = (ushort)Math.Max(0, v); ApplyIfRunning(); });
+                break;
             case SiggenTimingModel.Continuous:
-                AddNumberRow(TimingHost, "Duration", "ms (0 = continuous)",
+                AddNumberRow(TimingHost, "Duration", "ms (0 = until stopped)",
                     _config.DurationMs, 0, 600000, 100,
                     v => { _config.DurationMs = (uint)Math.Max(0, v); ApplyIfRunning(); });
                 break;
             case SiggenTimingModel.Sweep:
                 AddNumberRow(TimingHost, "Sweep time", "ms",
-                    _config.DurationMs == 0 ? 1000 : _config.DurationMs, 10, 600000, 100,
+                    _config.DurationMs, 10, 600000, 100,
                     v => { _config.DurationMs = (uint)Math.Max(10, v); ApplyIfRunning(); });
-                AddNumberRow(TimingHost, "Repeat", "(0 = once)",
+                AddNumberRow(TimingHost, "Repeat", "sweeps (0 = until stopped)",
                     _config.Repeat, 0, 9999, 1,
                     v => { _config.Repeat = (ushort)Math.Max(0, v); ApplyIfRunning(); });
+                AddNumberRow(TimingHost, "Gap", "ms of silence between sweeps",
+                    _config.GapMs, 0, 60000, 10,
+                    v => { _config.GapMs = (ushort)Math.Max(0, v); ApplyIfRunning(); });
                 break;
             case SiggenTimingModel.Pattern:
-                AddNumberRow(TimingHost, "Repeat", "(0 = continuous)",
+                AddNumberRow(TimingHost, "Repeat", "periods (0 = until stopped)",
                     _config.Repeat, 0, 9999, 1,
                     v => { _config.Repeat = (ushort)Math.Max(0, v); ApplyIfRunning(); });
-                AddNumberRow(TimingHost, "Gap", "ms",
+                AddNumberRow(TimingHost, "Gap", "ms of extra silence per period",
                     _config.GapMs, 0, 60000, 10,
                     v => { _config.GapMs = (ushort)Math.Max(0, v); ApplyIfRunning(); });
                 break;
@@ -323,6 +413,11 @@ public sealed partial class TestSignalsWindow : Window
         grid.Children.Add(box);
 
         host.Children.Add(grid);
+
+        // The box shows a clamped value; push it back into the draft so the config
+        // cannot keep an out-of-range number the firmware would silently replace with
+        // a fallback of its own.
+        if (box.Value != value) onChanged(box.Value);
     }
 
     // ── Type selection ──
@@ -331,9 +426,13 @@ public sealed partial class TestSignalsWindow : Window
     {
         if (_isUpdating || TypeGrid.SelectedItem is not TypeItem item) return;
         _config.SignalType = item.Desc.Id;
+        ApplyTypeConstraints(item.Desc);
         BuildTypeSpecific(item.Desc);
         ApplyIfRunning();
     }
+
+    private SiggenTypeDesc? SelectedDesc =>
+        (TypeGrid.SelectedItem as TypeItem)?.Desc;
 
     // ── Level ──
 
@@ -347,18 +446,31 @@ public sealed partial class TestSignalsWindow : Window
         ApplyIfRunning();
     }
 
-    private void OnLevelTextChanged(object sender, TextChangedEventArgs e)
+    private void OnLevelCommit(object sender, RoutedEventArgs e) => CommitLevelText();
+
+    private void OnLevelKeyDown(object sender, KeyRoutedEventArgs e)
+    {
+        if (e.Key != Windows.System.VirtualKey.Enter) return;
+        CommitLevelText();
+        e.Handled = true;
+    }
+
+    private void CommitLevelText()
     {
         if (_isUpdating) return;
-        if (float.TryParse(LevelBox.Text, NumberStyles.Float, CultureInfo.InvariantCulture, out float v))
+        if (!float.TryParse(LevelBox.Text, NumberStyles.Float, CultureInfo.InvariantCulture, out float v))
         {
-            _isUpdating = true;
-            v = Math.Clamp(v, SiggenConfig.LevelMinDb, SiggenConfig.LevelMaxDb);
-            _config.LevelDb = v;
-            LevelSlider.Value = v;
-            _isUpdating = false;
-            ApplyIfRunning();
+            LevelBox.Text = _config.LevelDb.ToString("F0", CultureInfo.InvariantCulture);
+            return;
         }
+
+        v = Math.Clamp(v, SiggenConfig.LevelMinDb, SiggenConfig.LevelMaxDb);
+        _isUpdating = true;
+        _config.LevelDb = v;
+        LevelSlider.Value = v;
+        LevelBox.Text = v.ToString("F0", CultureInfo.InvariantCulture);
+        _isUpdating = false;
+        ApplyIfRunning();
     }
 
     // ── Flags ──
@@ -371,6 +483,11 @@ public sealed partial class TestSignalsWindow : Window
         if (DecorrToggle.IsChecked == true) flags |= SiggenFlags.Decorrelate;
         if (WalkToggle.IsChecked == true) flags |= SiggenFlags.Walk;
         _config.Flags = flags;
+
+        // WALK reinterprets the timing fields of a continuous signal, so the timing
+        // rows have to be rebuilt when it changes.
+        if (SelectedDesc is { } desc) BuildTypeSpecific(desc);
+
         ApplyIfRunning();
     }
 
@@ -378,6 +495,18 @@ public sealed partial class TestSignalsWindow : Window
 
     private async void OnStartStopClick(object sender, RoutedEventArgs e)
     {
+        if (!_running && _config.ChannelMask == 0)
+        {
+            // SET_CONFIG rejects an empty mask; say so instead of showing "Rejected".
+            StatusText.Text = "Idle";
+            StatusDetail.Text = "Select at least one output channel.";
+            return;
+        }
+
+        // Drop any debounced edit: SET_CONFIG landing during the stop's fade-out is a
+        // restart to the firmware, and Start sends the whole draft anyway.
+        _applyTimer.Stop();
+
         StartStopButton.IsEnabled = false;
         try
         {
@@ -401,9 +530,13 @@ public sealed partial class TestSignalsWindow : Window
         }
     }
 
+    /// <summary>Restage the draft on a running generator, debounced: every SET_CONFIG
+    /// while running costs a fade-out/swap/fade-in restart in the firmware.</summary>
     private void ApplyIfRunning()
     {
-        if (_running) _ = _viewModel.ApplySiggenConfigAsync();
+        if (!_running) return;
+        _applyTimer.Stop();
+        _applyTimer.Start();
     }
 
     // ── Status ──
@@ -435,7 +568,8 @@ public sealed partial class TestSignalsWindow : Window
         if (status == null || !running)
         {
             StatusText.Text = "Idle";
-            StatusDetail.Text = "";
+            StatusDetail.Text = _config.ChannelMask == 0
+                ? "Select at least one output channel." : "";
             return;
         }
 
@@ -462,6 +596,13 @@ public sealed partial class TestSignalsWindow : Window
     private void OnClosed(object sender, WindowEventArgs args)
     {
         _pollTimer.Stop();
+        _applyTimer.Stop();
         _viewModel.PropertyChanged -= OnViewModelPropertyChanged;
+
+        // Closing the window is the user's only stop affordance, so never leave a signal
+        // playing with nothing to control it. Sent unconditionally rather than on
+        // _running: a start could still be in flight, and CONTROL(STOP) on an idle
+        // generator is a no-op the firmware acknowledges. The fade avoids a click.
+        if (_viewModel.SiggenSupported) _ = _viewModel.StopSiggenAsync();
     }
 }

@@ -136,8 +136,12 @@ public class FilterParams : IEquatable<FilterParams>
     public Guid Id { get; } = Guid.NewGuid();
     public FilterType Type { get; set; } = FilterType.Flat;
     public float Frequency { get; set; } = 1000.0f;
-    public float Q { get; set; } = 0.707f;
+    public float Q { get; set; } = DefaultQ;
     public float Gain { get; set; } = 0.0f;
+
+    /// <summary>Neutral (Butterworth) Q — the value a band falls back to when it
+    /// has no meaningful Q of its own.</summary>
+    public const float DefaultQ = 0.707f;
     public bool IsActive { get; set; } = true; // For UI visibility toggle only
 
     /// <summary>

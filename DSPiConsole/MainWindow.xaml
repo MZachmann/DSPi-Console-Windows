@@ -26,16 +26,30 @@
                 <FontIcon Glyph="&#xE700;" FontSize="14"/>
                 <Button.Flyout>
                     <MenuFlyout Placement="BottomEdgeAlignedLeft" Opening="OnMainMenuOpening">
-                        <MenuFlyoutItem Text="Import Filters..." Click="OnImportFiltersClick">
-                            <MenuFlyoutItem.KeyboardAccelerators>
-                                <KeyboardAccelerator Modifiers="Control" Key="I"/>
-                            </MenuFlyoutItem.KeyboardAccelerators>
-                        </MenuFlyoutItem>
-                        <MenuFlyoutItem Text="Export Filters..." Click="OnExportFiltersClick">
-                            <MenuFlyoutItem.KeyboardAccelerators>
-                                <KeyboardAccelerator Modifiers="Control" Key="E"/>
-                            </MenuFlyoutItem.KeyboardAccelerators>
-                        </MenuFlyoutItem>
+                        <MenuFlyoutSubItem Text="Import">
+                            <MenuFlyoutItem x:Name="ImportPresetMenuItem" Text="Preset File..." Click="OnImportPresetClick">
+                                <MenuFlyoutItem.KeyboardAccelerators>
+                                    <KeyboardAccelerator Modifiers="Control,Shift" Key="I"/>
+                                </MenuFlyoutItem.KeyboardAccelerators>
+                            </MenuFlyoutItem>
+                            <MenuFlyoutItem Text="Filters..." Click="OnImportFiltersClick">
+                                <MenuFlyoutItem.KeyboardAccelerators>
+                                    <KeyboardAccelerator Modifiers="Control" Key="I"/>
+                                </MenuFlyoutItem.KeyboardAccelerators>
+                            </MenuFlyoutItem>
+                        </MenuFlyoutSubItem>
+                        <MenuFlyoutSubItem Text="Export">
+                            <MenuFlyoutItem x:Name="ExportPresetMenuItem" Text="Preset File..." Click="OnExportPresetClick">
+                                <MenuFlyoutItem.KeyboardAccelerators>
+                                    <KeyboardAccelerator Modifiers="Control,Shift" Key="E"/>
+                                </MenuFlyoutItem.KeyboardAccelerators>
+                            </MenuFlyoutItem>
+                            <MenuFlyoutItem Text="Filters..." Click="OnExportFiltersClick">
+                                <MenuFlyoutItem.KeyboardAccelerators>
+                                    <KeyboardAccelerator Modifiers="Control" Key="E"/>
+                                </MenuFlyoutItem.KeyboardAccelerators>
+                            </MenuFlyoutItem>
+                        </MenuFlyoutSubItem>
                         <MenuFlyoutSeparator/>
                         <MenuFlyoutSubItem x:Name="AutoEQMenu" Text="AutoEQ">
                             <MenuFlyoutItem Text="Browse Profiles..." Click="OnAutoEQBrowseClick">
@@ -61,6 +75,11 @@
                         <MenuFlyoutItem Text="Psychoacoustic Bass..." Click="OnPsybassClick">
                             <MenuFlyoutItem.KeyboardAccelerators>
                                 <KeyboardAccelerator Modifiers="Control,Shift" Key="P"/>
+                            </MenuFlyoutItem.KeyboardAccelerators>
+                        </MenuFlyoutItem>
+                        <MenuFlyoutItem Text="Stereo Upmixer..." Click="OnUpmixClick">
+                            <MenuFlyoutItem.KeyboardAccelerators>
+                                <KeyboardAccelerator Modifiers="Control,Shift" Key="U"/>
                             </MenuFlyoutItem.KeyboardAccelerators>
                         </MenuFlyoutItem>
                         <MenuFlyoutItem Text="Matrix Mixer..." Click="OnMatrixMixerClick">
@@ -175,6 +194,28 @@
                     <Setter Property="VerticalAlignment" Value="Center" />
                     <Setter Property="TextAlignment" Value="Right" />
                 </Style>
+
+                <!-- Chromeless button for the sidebar badge hit area: being a real
+                     Button keeps clicks from selecting the ListView row, and the
+                     bare template adds no hover/press visuals. -->
+                <Style x:Key="BadgeHitButtonStyle" TargetType="Button">
+                    <Setter Property="Background" Value="Transparent" />
+                    <Setter Property="BorderThickness" Value="0" />
+                    <Setter Property="MinWidth" Value="0" />
+                    <Setter Property="MinHeight" Value="0" />
+                    <Setter Property="IsTabStop" Value="False" />
+                    <Setter Property="Template">
+                        <Setter.Value>
+                            <ControlTemplate TargetType="Button">
+                                <Border Background="Transparent"
+                                        Padding="{TemplateBinding Padding}">
+                                    <ContentPresenter HorizontalAlignment="Center"
+                                                      VerticalAlignment="Center" />
+                                </Border>
+                            </ControlTemplate>
+                        </Setter.Value>
+                    </Setter>
+                </Style>
             </Grid.Resources>
 
             <!--This determines the sidebar width-->
@@ -277,8 +318,10 @@
                                 RightTapped="OnSidebarPsybassRightClick"
                                 ToolTipService.ToolTip="Psychoacoustic Bass (right-click for settings)"
                                 PointerEntered="OnShortcutIconPointerEntered" PointerExited="OnShortcutIconPointerExited">
-                            <!-- Bass clef; not in Segoe Fluent Icons, so pull it from Segoe UI Symbol -->
-                            <FontIcon x:Name="PsybassIcon" Glyph="&#x1D122;" FontSize="16"
+                            <!-- Bass clef; not in Segoe Fluent Icons, so pull it from Segoe UI Symbol.
+                                 The glyph sits small within its em box, so it runs a couple of
+                                 points larger than the Fluent icons to match them optically. -->
+                            <FontIcon x:Name="PsybassIcon" Glyph="&#x1D122;" FontSize="18"
                                       FontFamily="Segoe UI Symbol"
                                       HorizontalAlignment="Center"
                                       Foreground="{ThemeResource TextFillColorGhostlyBrush}" IsHitTestVisible="False" />
@@ -488,8 +531,8 @@
                                Opacity="0.3" HorizontalAlignment="Center" VerticalAlignment="Center"/>
                 </controls:ResizeGripper>
 
-                <toolkit:WrapPanel x:Name="LegendPanel" Grid.Row="2"
-                                   HorizontalSpacing="8" VerticalSpacing="6" Margin="0,4,0,16" />
+                <!-- (The graph legend pills lived here in Grid.Row 2 — their
+                     show/hide role moved to the sidebar channel badges.) -->
 
                 <Grid Grid.Row="3">
                     <Grid.RowDefinitions>

@@ -226,6 +226,54 @@ public partial class MainViewModel
         return result;
     }
 
+    /// <summary>Display name for a binding's channel target, using the same
+    /// user-editable names the sidebar shows (so a rename is reflected here).
+    /// Falls back to a plain positional label if the firmware advertises a
+    /// target the app's channel model doesn't cover.</summary>
+    public string CsTargetLabel(CsTarget kind, int index)
+    {
+        var ch = CsTargetChannel(kind, index);
+        if (ch != null) return GetChannelName(ch);
+        return kind switch
+        {
+            CsTarget.InputCh => $"Input {index + 1}",
+            CsTarget.OutputCh => $"Output {index + 1}",
+            _ => $"Channel {index + 1}",
+        };
+    }
+
+    /// <summary>The app channel a CS target addresses, or null if out of range.
+    /// INPUT_CH indexes the wire input region, OUTPUT_CH the output position, and
+    /// DSP_CH / DSP_BAND the unified channel space (inputs then outputs).</summary>
+    private Channel? CsTargetChannel(CsTarget kind, int index)
+    {
+        if (index < 0) return null;
+        return kind switch
+        {
+            CsTarget.InputCh => index < Channel.AllInputs.Count ? Channel.AllInputs[index] : null,
+            CsTarget.OutputCh => index < ActiveOutputs.Count ? ActiveOutputs[index] : null,
+            CsTarget.DspCh or CsTarget.DspBand =>
+                ChannelForAppId(ChannelMap.WireToApp(index, _device.NumInputChannels)),
+            _ => null,
+        };
+    }
+
+    /// <summary>App channel id → its <see cref="Channel"/>. Outputs resolve through
+    /// <see cref="ActiveOutputs"/> so RP2040 gets its own PDM entry rather than the
+    /// SPDIF 3 L channel that shares the id.</summary>
+    private Channel? ChannelForAppId(int appId)
+    {
+        if (appId < 0) return null;
+        if (appId < ChannelMap.AppInputCount) return Channel.AllInputs[appId];
+        if (appId >= ChannelMap.ExtraInputFirstId)
+        {
+            int i = ChannelMap.AppInputCount + (appId - ChannelMap.ExtraInputFirstId);
+            return i < Channel.AllInputs.Count ? Channel.AllInputs[i] : null;
+        }
+        int pos = appId - ChannelMap.AppInputCount;
+        return pos < ActiveOutputs.Count ? ActiveOutputs[pos] : null;
+    }
+
     /// <summary>Arm IR learn (10 s window). False if no live IR receiver.</summary>
     public bool CsIrLearnArm() => _device.CsIrLearnArm();
 

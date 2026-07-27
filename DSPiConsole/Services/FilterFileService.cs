@@ -66,20 +66,37 @@ public static class FilterFileService
             return string.Format(inv, "Filter {0,2}: OFF", index);
         }
 
-        // REW-style text export understands only the standard 2nd-order PEQ
-        // codes; the first-order variants map to their closest standard code
-        // (lossy — REW has no first-order concept).
+        // The 2nd-order types keep their REW codes so exports stay readable by
+        // other tools. The first-order variants (V13/V14) and the Linkwitz
+        // Transform (V22) have no REW equivalent, so they use DSPi-only codes —
+        // folding them onto the standard codes would silently change the filter.
         var typeCode = filter.Type switch
         {
             FilterType.Peaking => "PK",
-            FilterType.LowShelf or FilterType.LowShelf1 => "LS",
-            FilterType.HighShelf or FilterType.HighShelf1 => "HS",
+            FilterType.LowShelf => "LS",
+            FilterType.HighShelf => "HS",
             FilterType.LowPass => "LP",
             FilterType.HighPass => "HP",
             FilterType.Notch => "NO",
-            FilterType.AllPass or FilterType.AllPass1 => "AP",
+            FilterType.AllPass => "AP",
+            FilterType.AllPass1 => "AP1",
+            FilterType.LowShelf1 => "LS1",
+            FilterType.HighShelf1 => "HS1",
+            FilterType.LinkwitzTransform => "LT",
             _ => "PK"
         };
+
+        // The Linkwitz Transform reuses the wire fields with bespoke meaning:
+        // Fc = f0 and Q = Q0 (the driver's sealed-box rolloff), Gain = fp in Hz
+        // and Qp = the target pole. fp is written as an explicit "Fp ... Hz"
+        // token rather than "Gain ... dB", which would misread as a level.
+        if (filter.Type == FilterType.LinkwitzTransform)
+        {
+            return string.Format(inv,
+                "Filter {0,2}: ON  {1,-8}Fc {2,7:F1} Hz  Q {3,5:F2}  Fp {4,7:F1} Hz  Qp {5,5:F2}",
+                index, typeCode, filter.Frequency, filter.Q, filter.Gain, filter.Qp)
+                + BypassTag(filter);
+        }
 
         var line = string.Format(inv, "Filter {0,2}: ON  {1,-8}Fc {2,7:F1} Hz",
             index, typeCode, filter.Frequency);
@@ -94,8 +111,14 @@ public static class FilterFileService
             line += string.Format(inv, "  Q {0,5:F2}", filter.Q);
         }
 
-        return line;
+        return line + BypassTag(filter);
     }
+
+    /// <summary>
+    /// Trailing marker for a band the user has bypassed (firmware 1.1.4+).
+    /// Absent for normal bands, so ordinary exports keep their REW-like shape.
+    /// </summary>
+    private static string BypassTag(FilterParams filter) => filter.Bypass ? "  BYP" : "";
 
     private static string FormatXoverFilter(int index, FilterParams filter)
     {
@@ -173,7 +196,6 @@ public static class FilterFileService
                     if (ch.Name.Equals(channelName, StringComparison.OrdinalIgnoreCase))
                     {
                         currentChannel = (int)ch.Id;
-                        result[currentChannel.Value] = new List<FilterParams>();
                         break;
                     }
                 }
@@ -200,10 +222,15 @@ public static class FilterFileService
             // Parse PEQ filter line
             if (!trimmed.Contains("Filter") || !trimmed.Contains(':')) continue;
 
+            // The PEQ list is created on the first parsed band, not at the
+            // channel header — a crossover-only section must not be read as
+            // "this channel has zero PEQ bands", which would wipe its EQ.
             var filter = ParseFilterLine(trimmed);
             if (filter != null)
             {
-                result[currentChannel.Value].Add(filter);
+                if (!result.TryGetValue(currentChannel.Value, out var bands))
+                    result[currentChannel.Value] = bands = new List<FilterParams>();
+                bands.Add(filter);
             }
         }
 
@@ -226,18 +253,16 @@ public static class FilterFileService
             return new FilterParams(FilterType.Flat, 1000, 0.707f, 0);
         }
 
-        // Family tag (LR / BW / Bessel)
-        XoverFamily family;
-        if (upper.Contains(" LR ")) family = XoverFamily.LinkwitzRiley;
-        else if (upper.Contains(" BW ")) family = XoverFamily.Butterworth;
-        else if (upper.Contains(" BESSEL ")) family = XoverFamily.Bessel;
-        else return null;
+        // Family + shape tags, e.g. "ON  LR     HP" or "ON  Bessel LP". Read as
+        // one anchored pair so the tokens can't be picked up out of order.
+        var tagMatch = Regex.Match(line, @"\bON\s+(\S+)\s+(HP|LP)\b", RegexOptions.IgnoreCase);
+        if (!tagMatch.Success) return null;
 
-        // Shape (HP / LP)
-        bool isHighPass;
-        if (upper.Contains(" HP ")) isHighPass = true;
-        else if (upper.Contains(" LP ")) isHighPass = false;
-        else return null;
+        var parsedFamily = CrossoverFilter.ParseShortFamily(tagMatch.Groups[1].Value);
+        if (parsedFamily is null or XoverFamily.None) return null;
+        var family = parsedFamily.Value;
+
+        bool isHighPass = tagMatch.Groups[2].Value.Equals("HP", StringComparison.OrdinalIgnoreCase);
 
         // Frequency (Fc XXX Hz)
         float freq = 1000f;
@@ -297,9 +322,18 @@ public static class FilterFileService
             return new FilterParams(FilterType.Flat, 1000, 0.707f, 0);
         }
 
-        // Detect filter type
+        // Detect filter type. The DSPi-only codes are tested first so a
+        // first-order band can never be read back as its 2nd-order namesake.
         FilterType filterType;
-        if (upper.Contains(" PK ") || upper.Contains(" PEQ "))
+        if (upper.Contains(" AP1 "))
+            filterType = FilterType.AllPass1;
+        else if (upper.Contains(" LS1 "))
+            filterType = FilterType.LowShelf1;
+        else if (upper.Contains(" HS1 "))
+            filterType = FilterType.HighShelf1;
+        else if (upper.Contains(" LT "))
+            filterType = FilterType.LinkwitzTransform;
+        else if (upper.Contains(" PK ") || upper.Contains(" PEQ "))
             filterType = FilterType.Peaking;
         else if (upper.Contains(" LP ") || upper.Contains(" LPQ "))
             filterType = FilterType.LowPass;
@@ -332,7 +366,7 @@ public static class FilterFileService
             gain = gainVal;
         }
 
-        // Extract Q
+        // Extract Q. The \s guard keeps this off the Linkwitz Transform's "Qp".
         float q = 0.707f;
         var qMatch = Regex.Match(line, @"\sQ\s+([\d.,]+)", RegexOptions.IgnoreCase);
         if (qMatch.Success && TryParseDecimal(qMatch.Groups[1].Value, out var qVal))
@@ -340,7 +374,27 @@ public static class FilterFileService
             q = qVal;
         }
 
-        return new FilterParams(filterType, freq, q, gain);
+        var filter = new FilterParams(filterType, freq, q, gain);
+
+        // Linkwitz Transform sidecars: Fp lands in Gain (Hz, not dB) and Qp in
+        // its own field. A file missing Fp falls back to fp = f0, which is the
+        // neutral "no shift" case rather than a silent 0 Hz pole.
+        if (filterType == FilterType.LinkwitzTransform)
+        {
+            var fpMatch = Regex.Match(line, @"\bFp\s+([\d.,]+)", RegexOptions.IgnoreCase);
+            filter.Gain = fpMatch.Success && TryParseDecimal(fpMatch.Groups[1].Value, out var fpVal)
+                ? fpVal
+                : freq;
+
+            var qpMatch = Regex.Match(line, @"\bQp\s+([\d.,]+)", RegexOptions.IgnoreCase);
+            if (qpMatch.Success && TryParseDecimal(qpMatch.Groups[1].Value, out var qpVal))
+                filter.Qp = qpVal;
+        }
+
+        // Per-band bypass marker (firmware 1.1.4+).
+        filter.Bypass = upper.Contains(" BYP");
+
+        return filter;
     }
 
     /// <summary>
